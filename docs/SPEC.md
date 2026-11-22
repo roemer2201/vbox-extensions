@@ -3,7 +3,7 @@
 | Feld    | Wert                                   |
 |---------|----------------------------------------|
 | Status  | Entwurf                                |
-| Version | 0.1.0 (2026-11-21)                     |
+| Version | 0.2.0 (2026-11-22)                     |
 | Ziel    | VirtualBox 7.2 auf Linux-Hosts (Ubuntu) |
 
 ---
@@ -203,8 +203,8 @@ verständlicher Meldung (Ausnahme: als Warnung markierte Punkte).
 Für VMs, die nicht laufen. Keine Ausfallzeit im eigentlichen Sinn.
 
 1. Vorprüfungen.
-2. Ordner nach `<Ziel>/<Ordnername>.relocate-tmp` kopieren
-   (`cp -a --reflink=auto`).
+2. Ordner nach `<Ziel>/<Ordnername>.relocate-tmp` kopieren: per
+   `cp -a --reflink=always`, wenn Reflink möglich ist, sonst per `rsync`.
 3. Kopie prüfen (Abschnitt 6.6), dann in den endgültigen Namen umbenennen.
 4. `VBoxManage unregistervm <uuid>` (ohne `--delete`).
 5. `VBoxManage registervm <Ziel>/<Name>.vbox`.
@@ -384,7 +384,19 @@ Fehlermeldungen, Exit-Status 0/1, Aufruffehler 2).
 
 ### 9.2 Optionen
 
-Präzedenz: Kommandozeile > Umgebungsvariable > Standardwert.
+Präzedenz: Kommandozeile > Umgebungsvariable > Konfigurationsdatei >
+Standardwert.
+
+**Konfigurationsdatei (E2):** nur nutzerspezifisch im Home-Verzeichnis, wird
+gesourct, die erste gefundene Datei gilt:
+
+1. `~/.config/<ORGANIZATION>/vbox-relocate.conf` (ORGANIZATION aus `/etc/org.conf`)
+2. `~/.config/orgdefault/vbox-relocate.conf`
+3. `~/.config/vbox-relocate.conf`
+
+Schlüssel: `TARGET`, `STRATEGY`, `RAM_MODE`, `RAM_RESERVE`, `VERIFY`,
+`KEEP_SOURCE`, `START_TYPE`, `VBOXMANAGE`, `STATE_DIR`, `VERBOSE`, `SILENT`.
+Beispiel: `examples/vbox-relocate.conf`.
 
 | Option | Umgebungsvariable | Standard | Bedeutung |
 |--------|-------------------|----------|-----------|
@@ -404,14 +416,17 @@ Präzedenz: Kommandozeile > Umgebungsvariable > Standardwert.
 
 ### 9.3 Maschinenlesbares Protokoll (stdout)
 
-Zeilenbasiert, ASCII, ohne JSON-Abhängigkeit. Fehlermeldungen gehen weiterhin
-nach stderr.
+Zeilenbasiert, ASCII, ohne JSON-Abhängigkeit. Fehlermeldungen und die
+Ausgaben aufgerufener VBoxManage-Befehle gehen nach stderr, damit stdout nur
+Protokollzeilen enthält. `list` gibt je VM eine Zeile
+`VM uuid=".." name=".." state=".." folder=".." size_bytes=".." snapshots=".."` aus.
 
 ```
 PLAN key="value"                 # nur bei "plan", eine Zeile je Eigenschaft
 STEP <id> <text>                 # Beginn eines Schritts
 PROGRESS <0-100> <id>            # Fortschritt des aktuellen Schritts
 DOWNTIME begin|end               # Beginn/Ende der Umschaltphase
+INFO <text> / DEBUG <text>       # Statusmeldungen
 WARN <text>
 RESULT ok|failed|rolled-back     # letzte Zeile
 ```
@@ -481,7 +496,11 @@ libexec/vbox-relocate-helper         # Root-Helfer (Bash)
 polkit/io.github.roemer2201.vboxrelocate.policy
 gui/vbox_relocate_gui/               # PySide6-Anwendung
 gui/vbox-relocate-gui.desktop
-tests/                               # Unit-Tests (z. B. bats) und Testplan
+examples/vbox-relocate.conf          # Beispiel der Nutzerkonfiguration
+tests/unit.bats                      # Unit-Tests (ohne VirtualBox)
+tests/integration.bats               # Tests gegen echtes VBoxManage
+tests/helpers/vboxmanage-sim         # simuliert laufende VMs im Container
+LICENSE                              # GPL-3.0
 packaging/                           # spaeter: .deb
 ```
 
@@ -512,18 +531,18 @@ Berechnungen). Integrationstests laufen auf einem echten Host.
 
 ## 14. Im Prototyp zu verifizieren
 
-| # | Annahme |
-|---|---------|
-| V1 | `unregistervm` ohne `--delete` lässt `.vbox` (inkl. Snapshots und gespeichertem Zustand) unverändert; `registervm` am neuen Ort löst alle relativen Pfade korrekt auf. |
-| V2 | Wiederherstellung aus einer `.sav`, die ein Symlink in den tmpfs ist, funktioniert; VirtualBox löscht danach nur den Symlink. |
-| V3 | Während `savestate` landet im overlay-`upperdir` nur die neue `.sav` (kein Copy-up von Differenz-Images). |
-| V4 | Verhalten bei fehlgeschlagenem `savestate` (z. B. tmpfs voll): läuft die VM weiter? |
-| V5 | `cp --reflink=always` funktioniert zwischen den betroffenen Verzeichnissen (auch über Subvolume- und Mount-Grenzen desselben btrfs). |
-| V6 | VirtualBox Manager verhält sich beim Ab- und Anmelden derselben UUID unauffällig. |
-| V7 | Online-Löschen des temporären Snapshots am Ziel führt korrekt zusammen und entfernt dessen `.sav`. |
-| V8 | Ermittlung des ursprünglichen Start-Typs (`gui`/`headless`) aus `showvminfo`. |
-| V9 | Tatsächliche `.sav`-Größe im Vergleich zur Schätzung. |
-| V10 | Erkennung von Medien in der globalen Registry mit absolutem Pfad. |
+| # | Annahme | Stand |
+|---|---------|-------|
+| V1 | `unregistervm` ohne `--delete` lässt `.vbox` (inkl. Snapshots und gespeichertem Zustand) unverändert; `registervm` am neuen Ort löst alle relativen Pfade korrekt auf. | Bestätigt mit VirtualBox 7.0.16 im Testcontainer (ausgeschaltete VM mit Snapshot-Baum, gespeicherter Zustand per `adoptstate`). Auf 7.2 mit echter laufender VM noch zu prüfen. |
+| V2 | Wiederherstellung aus einer `.sav`, die ein Symlink in den tmpfs ist, funktioniert; VirtualBox löscht danach nur den Symlink. | offen (Phase 2) |
+| V3 | Während `savestate` landet im overlay-`upperdir` nur die neue `.sav` (kein Copy-up von Differenz-Images). | offen (Phase 2) |
+| V4 | Verhalten bei fehlgeschlagenem `savestate` (z. B. tmpfs voll): läuft die VM weiter? | offen; die CLI prüft den Zustand nach dem Fehler und bricht ohne Änderung ab, wenn die VM noch läuft. |
+| V5 | `cp --reflink=always` funktioniert zwischen den betroffenen Verzeichnissen (auch über Subvolume- und Mount-Grenzen desselben btrfs). | Bestätigt zwischen Subvolumes (Kernel 6.18, Testcontainer). Die CLI prüft das vor jedem Lauf mit einer Probedatei. |
+| V6 | VirtualBox Manager verhält sich beim Ab- und Anmelden derselben UUID unauffällig. | offen (Host-Test) |
+| V7 | Online-Löschen des temporären Snapshots am Ziel führt korrekt zusammen und entfernt dessen `.sav`. | offen (Phase 4) |
+| V8 | Ermittlung des ursprünglichen Start-Typs (`gui`/`headless`) aus `showvminfo`. | Laut Quellcode (`MachineImpl.cpp`): `SessionName` ist `GUI/Qt` (auch für `separate`) oder `headless`. Umgesetzt; auf dem Host zu prüfen. |
+| V9 | Tatsächliche `.sav`-Größe im Vergleich zur Schätzung. | offen (Host-Test) |
+| V10 | Erkennung von Medien in der globalen Registry mit absolutem Pfad. | Umgesetzt als Textsuche in `VirtualBox.xml`; mit echten Altlasten noch nicht getestet. |
 
 ---
 
@@ -532,7 +551,7 @@ Berechnungen). Integrationstests laufen auf einem echten Host.
 | Phase | Inhalt | Ergebnis |
 |-------|--------|----------|
 | 0 | Spezifikation (dieses Dokument) | `docs/SPEC.md` |
-| 1 | CLI: `list`, `plan`, Vorprüfungen, Strategien `offline` und `reflink` (ohne RAM-Modus), Rückfall, Journal | nutzbares CLI für den Hauptfall |
+| 1 | CLI: `list`, `plan`, Vorprüfungen, Strategien `offline` und `reflink` (ohne RAM-Modus), Rückfall, Journal | **umgesetzt** (`bin/vbox-relocate` 0.1.0), Host-Test ausstehend |
 | 2 | RAM-Modus: Helfer, polkit, overlay/tmpfs | Umschaltphase ohne Platten-Schreibzugriffe |
 | 3 | GUI (PySide6) | Bedienung mit Fortschrittsanzeige |
 | 4 | Strategie `copy` (anderes Dateisystem) | Umzug auf beliebige Dateisysteme |
@@ -540,15 +559,15 @@ Berechnungen). Integrationstests laufen auf einem echten Host.
 
 ---
 
-## 16. Offene Entscheidungen
+## 16. Entscheidungen
 
-| # | Frage | Vorschlag |
-|---|-------|-----------|
-| E1 | Logging (syslog/journal, Format, Stufen) | Wird vom Auftraggeber festgelegt; bis dahin nur stdout/stderr. |
-| E2 | Konfigurationsdatei (organisationsbasiert nach Skript-Konventionen)? | Zunächst nicht; Optionen und Umgebungsvariablen genügen. |
-| E3 | Standardverhalten Quelle: löschen oder behalten? | Löschen nach erfolgreichem Start, `--keep-source` optional. |
-| E4 | Kopierwerkzeug für `copy`: `rsync` oder eigene Schleife mit `cp`/`dd` | `rsync` (Fortschritt, Restabgleich). |
-| E5 | Lizenz des Repositories | offen |
+| # | Frage | Stand |
+|---|-------|-------|
+| E1 | Logging (syslog/journal, Format, Stufen) | **offen** – wird vom Auftraggeber festgelegt; bis dahin nur stdout/stderr (im Code als TODO markiert). |
+| E2 | Konfigurationsdatei | **entschieden:** nutzerspezifische Datei im Home (Abschnitt 9.2). |
+| E3 | Standardverhalten Quelle: löschen oder behalten? | **entschieden:** löschen nach erfolgreichem Abschluss, `--keep-source` optional. |
+| E4 | Kopierwerkzeug ohne Reflink | **entschieden:** `rsync`. |
+| E5 | Lizenz des Repositories | **entschieden:** GPL-3.0 (`LICENSE`). |
 
 ---
 

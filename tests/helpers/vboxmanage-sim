@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+#
+# vboxmanage-sim
+#
+# Description:
+#   Test helper. Wraps the real VBoxManage and simulates running VMs, which
+#   cannot be started in a test container without the VirtualBox kernel
+#   driver. Registration, media handling, snapshots and saved-state files are
+#   handled by the real VBoxManage; only the run state is simulated:
+#   - "${VBOXSIM_DIR}/<uuid>.running" marks a VM as running (headless).
+#   - controlvm savestate: creates a dummy .sav in the snapshot folder and
+#     adopts it (real VirtualBox state "saved").
+#   - startvm: requires state "saved", discards the saved state (VirtualBox
+#     deletes the .sav after a successful restore) and marks the VM running.
+#   - VBOXSIM_FAIL=savestate|start|register|unregister injects failures;
+#     VBOXSIM_FAIL=register-once fails only the first registervm call.
+#   The Ubuntu wrapper /usr/bin/VBoxManage prints driver warnings on STDOUT;
+#   therefore the real binary below /usr/lib/virtualbox is used if present.
+#
+# Usage:
+#   VBOXSIM_DIR=/tmp/sim vboxmanage-sim <VBoxManage arguments>
+#
+# Version: 0.1.0  (2026-11-22)
+
+set -euo pipefail
+
+if [ -x /usr/lib/virtualbox/VBoxManage ]; then
+    REAL="${VBOXSIM_REAL:-/usr/lib/virtualbox/VBoxManage}"
+else
+    REAL="${VBOXSIM_REAL:-VBoxManage}"
+fi
+SIM_DIR="${VBOXSIM_DIR:?VBOXSIM_DIR must be set}"
+FAIL="${VBOXSIM_FAIL:-}"
+
+# Run the real VBoxManage.
+real() {
+    "${REAL}" "$@"
+}
+
+# Print the UUID of a VM given by name or UUID.
+uuid_of() {
+    real showvminfo "${1}" --machinereadable | sed -n 's/^UUID="\(.*\)"$/\1/p'
+}
+
+# Return 0 if the VM is marked as running.
+is_running() {
+    [ -f "${SIM_DIR}/${1}.running" ]
+}
+
+mkdir -p -- "${SIM_DIR}"
+cmd="${1:-}"
+
+case "${cmd}" in
+    showvminfo)
+        out="$(real "$@")"
+        uuid="$(printf '%s\n' "${out}" | sed -n 's/^UUID="\(.*\)"$/\1/p')"
+        if is_running "${uuid}"; then
+            printf '%s\n' "${out}" | sed 's/^VMState=.*/VMState="running"/'
+            printf 'SessionName="headless"\n'
+        else
+            printf '%s\n' "${out}"
+        fi
+        ;;
+    controlvm)
+        uuid="$(uuid_of "${2}")"
+        if [ "${3:-}" = "savestate" ]; then
+            if [ "${FAIL}" = "savestate" ]; then
+                echo "VBoxManage: error: simulated savestate failure" >&2
+                exit 1
+            fi
+            is_running "${uuid}" || { echo "VBoxManage: error: machine not running" >&2; exit 1; }
+            snap="$(real showvminfo "${uuid}" --machinereadable | sed -n 's/^SnapFldr="\(.*\)"$/\1/p')"
+            mkdir -p -- "${snap}"
+            sav="${snap}/$(date -u +%Y-%m-%dT%H-%M-%S-%N)Z.sav"
+            head -c 65536 /dev/zero > "${sav}"
+            real adoptstate "${uuid}" "${sav}"
+            rm -f -- "${SIM_DIR}/${uuid}.running"
+        elif [ "${3:-}" = "pause" ]; then
+            :
+        else
+            real "$@"
+        fi
+        ;;
+    startvm)
+        uuid="$(uuid_of "${2}")"
+        if [ "${FAIL}" = "start" ]; then
+            echo "VBoxManage: error: simulated start failure" >&2
+            exit 1
+        fi
+        state="$(real showvminfo "${uuid}" --machinereadable | sed -n 's/^VMState="\(.*\)"$/\1/p')"
+        if [ "${state}" = "saved" ]; then
+            sav="$(real showvminfo "${uuid}" --machinereadable | sed -n 's/^VMStateFile="\(.*\)"$/\1/p')"
+            [ -e "${sav}" ] || { echo "VBoxManage: error: saved state file missing: ${sav}" >&2; exit 1; }
+            real discardstate "${uuid}"
+            rm -f -- "${sav}"
+        fi
+        touch -- "${SIM_DIR}/${uuid}.running"
+        echo "VM \"${2}\" has been successfully started."
+        ;;
+    unregistervm)
+        uuid="$(uuid_of "${2}")"
+        if [ "${FAIL}" = "unregister" ] || is_running "${uuid}"; then
+            echo "VBoxManage: error: simulated unregister failure (or VM running)" >&2
+            exit 1
+        fi
+        real "$@"
+        ;;
+    registervm)
+        if [ "${FAIL}" = "register-once" ] && [ ! -e "${SIM_DIR}/register-failed-once" ]; then
+            touch -- "${SIM_DIR}/register-failed-once"
+            echo "VBoxManage: error: simulated register failure (once)" >&2
+            exit 1
+        fi
+        if [ "${FAIL}" = "register" ]; then
+            echo "VBoxManage: error: simulated register failure" >&2
+            exit 1
+        fi
+        real "$@"
+        ;;
+    *)
+        real "$@"
+        ;;
+esac
