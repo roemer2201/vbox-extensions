@@ -563,7 +563,7 @@ Berechnungen). Integrationstests laufen auf einem echten Host.
 
 | # | Frage | Stand |
 |---|-------|-------|
-| E1 | Logging (syslog/journal, Format, Stufen) | **offen** – wird vom Auftraggeber festgelegt; bis dahin nur stdout/stderr (im Code als TODO markiert). |
+| E1 | Logging (syslog/journal, Format, Stufen) | **entschieden:** Syslog (Tag `vbox-relocate`), normal mit Schritten, Warnungen, Fehlern und Ergebnis, mit `--verbose` zusätzlich Debug-Meldungen. Interaktiv auch im Terminal. |
 | E2 | Konfigurationsdatei | **entschieden:** nutzerspezifische Datei im Home (Abschnitt 9.2). |
 | E3 | Standardverhalten Quelle: löschen oder behalten? | **entschieden:** löschen nach erfolgreichem Abschluss, `--keep-source` optional. |
 | E4 | Kopierwerkzeug ohne Reflink | **entschieden:** `rsync`. |

@@ -134,3 +134,15 @@ EOF
     run bash -c '. "$0"; src_is_dedicated "$1/vm" mine.vbox' "${SCRIPT}" "${BATS_TEST_TMPDIR}"
     [ "${status}" -ne 0 ]
 }
+
+@test "default and verbose syslog levels keep protocol stdout clean" {
+    mkdir "${BATS_TEST_TMPDIR}/bin"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$LOG_CAPTURE"\n' > "${BATS_TEST_TMPDIR}/bin/logger"
+    chmod +x "${BATS_TEST_TMPDIR}/bin/logger"
+    export PATH="${BATS_TEST_TMPDIR}/bin:${PATH}" LOG_CAPTURE="${BATS_TEST_TMPDIR}/log"
+    run bash -c '. "$0"; MACHINE_READABLE=1; step verify Check; verbose Hidden; VERBOSE=1; verbose Details; result ok' "${SCRIPT}"
+    [ "${output}" = $'STEP verify Check\nDEBUG Details\nRESULT ok' ]
+    grep -F 'user.debug -- Details' "${LOG_CAPTURE}"
+    grep -F 'user.notice -- verify: Check' "${LOG_CAPTURE}"
+    ! grep -F Hidden "${LOG_CAPTURE}"
+}

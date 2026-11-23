@@ -37,7 +37,7 @@
 #   vbox-relocate recover <vm>
 #   vbox-relocate --help
 #
-# Version: 0.1.1  (2026-11-23)
+# Version: 0.2.0  (2026-11-23)
 #
 # License: GPL-3.0-only (see LICENSE in the repository)
 
@@ -48,7 +48,7 @@ set -euo pipefail
 
 # --- Fixed settings ----------------------------------------------------------
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.2.0"
 
 # Name of the user configuration file (searched below ${HOME}/.config).
 CONFIG_NAME="vbox-relocate.conf"
@@ -63,9 +63,8 @@ SPACE_RESERVE_BYTES=$((256 * 1024 * 1024))
 # Seconds to wait for the VM to reach "running" after startvm.
 START_TIMEOUT=180
 
-# TODO(logging): system logging (logger / journal) is intentionally not
-# implemented yet. The logging behaviour will be defined later (SPEC E1).
-# Until then all messages go to STDOUT / STDERR only.
+# logger failures must never interrupt a VM switchover.
+SYSLOG_FAILED=0
 
 # --- Built-in defaults (lowest precedence) -----------------------------------
 TARGET=""
@@ -206,11 +205,26 @@ mr_quote() {
     printf '"%s"' "${v}"
 }
 
+# Keep operational records separate from list/plan data and the GUI protocol.
+# Fall back to stderr if the local syslog socket is unavailable.
+syslog_event() {
+    local priority="${1}" message="${2}"
+    if [ "${SYSLOG_FAILED}" = 0 ]; then
+        if logger --socket-errors=on -t vbox-relocate -p "user.${priority}" -- "${VM_ARG:+[${VM_ARG}] }${message}" 2>/dev/null; then
+            return 0
+        fi
+        SYSLOG_FAILED=1
+        printf '%s\n' "vbox-relocate: syslog unavailable; using stderr" >&2
+    fi
+    if [ ! -t 2 ] && [ "${priority}" != err ]; then printf '%s\n' "${message}" >&2; fi
+}
+
 # Normal status message. Machine-readable mode: "INFO" record.
 info() {
+    syslog_event info "$*"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'INFO %s\n' "$*"
-    elif [ "${SILENT}" -ne 1 ]; then
+    elif [ "${SILENT}" -ne 1 ] && [ -t 1 ]; then
         printf '%s\n' "$*"
     fi
 }
@@ -220,24 +234,27 @@ verbose() {
     if [ "${VERBOSE}" -ne 1 ]; then
         return 0
     fi
+    syslog_event debug "$*"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'DEBUG %s\n' "$*"
-    else
+    elif [ -t 1 ]; then
         printf 'debug: %s\n' "$*"
     fi
 }
 
 # Warning. Machine-readable mode: "WARN" record on STDOUT, otherwise STDERR.
 warn() {
+    syslog_event warning "$*"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'WARN %s\n' "$*"
-    elif [ "${SILENT}" -ne 1 ]; then
+    elif [ "${SILENT}" -ne 1 ] && [ -t 2 ]; then
         printf '%s: warning: %s\n' "${SCRIPT_NAME}" "$*" >&2
     fi
 }
 
 # Error message, always on STDERR.
 err() {
+    syslog_event err "$*"
     printf '%s: error: %s\n' "${SCRIPT_NAME}" "$*" >&2
 }
 
@@ -259,9 +276,10 @@ usage_error() {
 step() {
     local id="${1}"
     shift
+    syslog_event notice "${id}: $*"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'STEP %s %s\n' "${id}" "$*"
-    elif [ "${SILENT}" -ne 1 ]; then
+    elif [ "${SILENT}" -ne 1 ] && [ -t 1 ]; then
         printf '==> %s\n' "$*"
     fi
 }
@@ -275,6 +293,7 @@ progress() {
 
 # Mark begin/end of the switchover (machine-readable mode only).
 downtime() {
+    syslog_event notice "Downtime ${1}"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'DOWNTIME %s\n' "${1}"
     fi
@@ -286,6 +305,7 @@ result() {
         return 0
     fi
     RESULT_EMITTED=1
+    syslog_event notice "Result: ${1}"
     if [ "${MACHINE_READABLE}" -eq 1 ]; then
         printf 'RESULT %s\n' "${1}"
     fi
@@ -499,6 +519,7 @@ vmi() {
 # Its normal output is sent to STDERR, so that it stays visible but cannot
 # disturb the machine-readable protocol on STDOUT.
 vbm_action() {
+    verbose "VBoxManage ${*}" >&2
     "${VBOXMANAGE}" "$@" >&2
 }
 
@@ -722,6 +743,7 @@ block() {
 # Record a warning for the plan output.
 note_warning() {
     WARNINGS+=("$*")
+    syslog_event warning "$*"
 }
 
 # Run all prechecks for VM_ARG and TARGET and fill the P_* variables.
@@ -1083,6 +1105,7 @@ print_plan() {
 # possible (no data is copied); otherwise rsync copies the data.
 copy_folder() {
     local src="${1}" tmp="${2}" pct
+    verbose "Copy source=${src}, target=${tmp}, reflink=${P_REFLINK}"
     progress 0 copy
     if [ "${P_REFLINK}" -eq 1 ]; then
         verbose "cp -a --reflink=always ${src} ${tmp}"
@@ -1368,7 +1391,7 @@ confirm() {
     if [ ! -t 0 ]; then
         die "Confirmation required but STDIN is not a terminal; use --yes"
     fi
-    printf 'Relocate VM "%s" to %s? [y/N] ' "${P_NAME}" "${P_DST}"
+    printf 'Relocate VM "%s" to %s? [y/N] ' "${P_NAME}" "${P_DST}" >&2
     read -r answer
     case "${answer,,}" in
         y|yes) return 0 ;;
@@ -1511,7 +1534,7 @@ cmd_recover() {
             die "Confirmation required but STDIN is not a terminal; use --yes"
         fi
         local answer
-        printf 'Roll back to %s? [y/N] ' "${J_SRC_DIR}"
+        printf 'Roll back to %s? [y/N] ' "${J_SRC_DIR}" >&2
         read -r answer
         case "${answer,,}" in
             y|yes) ;;
@@ -1537,6 +1560,7 @@ main() {
     validate_settings
 
     trap on_exit EXIT
+    verbose "Command=${SUBCOMMAND}, verify=${VERIFY}, RAM mode=${RAM_MODE}"
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
