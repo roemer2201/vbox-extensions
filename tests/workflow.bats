@@ -76,3 +76,35 @@ teardown() {
         [[ "${target}" = /dev/shm/vbox-workflow.* ]] && rm -rf -- "${target}"
     fi
 }
+
+@test "RAM with live copy preserves the kept source state after releasing tmpfs" {
+    VBOX_RELOCATE_RAM_MODE=require run --separate-stderr "${BATS_TEST_DIRNAME}/helpers/ram-workflow" run --keep-source
+    [ "${status}" = 0 ] || { echo "${output} ${stderr}"; return 1; }
+    [[ "${output}" == *'PLAN ram_decision="ram"'* ]]
+    old=("${src}.relocated-"*/Snapshots/switch.sav)
+    [ ! -L "${old[0]}" ] && [ "$(cat "${old[0]}")" = 'guest memory' ]
+    [ ! -e "${base}/ram-test" ]
+}
+
+@test "RAM rollback resumes the original saved state and releases the mount" {
+    WORKFLOW_FAIL=register VBOX_RELOCATE_RAM_MODE=require run --separate-stderr "${BATS_TEST_DIRNAME}/helpers/ram-workflow" run
+    [ "${status}" = 1 ] && [ "${lines[-1]}" = 'RESULT rolled-back' ]
+    [ "$(cat "${base}/registered")" = "${src}/VM.vbox" ]
+    [ ! -e "${base}/ram-test" ]
+}
+
+@test "offline relocation validates copied disks before removing source" {
+    printf '{"state":"poweroff"}' > "${src}/VM.vbox"
+    VBOX_RELOCATE_STRATEGY=auto run --separate-stderr "${script}" run --verify checksum
+    [ "${status}" = 0 ] || { echo "${output} ${stderr}"; return 1; }
+    [[ "${output}" == *'PLAN strategy="offline"'* ]] && [ "${lines[-1]}" = 'RESULT ok' ]
+    [ "$(cat "${WORKFLOW_TARGET}/VM/base.vdi")" = base ] && [ ! -d "${src}" ]
+}
+
+@test "offline relocation rejects dangling links at the destination" {
+    printf '{"state":"poweroff"}' > "${src}/VM.vbox"
+    ln -s -- "${base}/absent" "${WORKFLOW_TARGET}/VM"
+    VBOX_RELOCATE_STRATEGY=auto run --separate-stderr "${script}" run
+    [ "${status}" = 1 ] && [[ "${stderr}" == *"Target folder already exists"* ]]
+    [ -f "${src}/VM.vbox" ] && [ -L "${WORKFLOW_TARGET}/VM" ]
+}

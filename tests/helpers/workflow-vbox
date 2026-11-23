@@ -81,7 +81,7 @@ elif cmd == "controlvm" and args[1] in ("pause", "resume"):
     info["state"] = "paused" if args[1] == "pause" else "running"
     change()
 elif cmd == "unregistervm":
-    assert info["state"] == "saved"
+    assert info["state"] in ("saved", "poweroff")
     registry.unlink()
 elif cmd == "registervm":
     if fail == "register" and Path(args[0]).is_relative_to(Path(os.environ["WORKFLOW_TARGET"])):

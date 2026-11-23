@@ -8,27 +8,20 @@
 #   on the same host.
 #   - VMs that are not running are copied and re-registered (strategy
 #     "offline").
-#   - Running VMs are moved with a short switchover (strategy "reflink"):
-#     the VM state is saved, the folder is cloned with btrfs reflinks (no
-#     data is copied), the VM is re-registered at the new location and
-#     restored from the saved state.
-#   The source stays usable until the VM works at the target. Every failure
-#   after the first change triggers a rollback to the source.
+#   - Running VMs use a reflink clone or a live snapshot and rsync pre-copy.
+#     The final saved state can be captured in tmpfs via the polkit helper.
 #
 # Program flow (subcommand "run"):
-#   1. Resolve configuration (default < user config < env < CLI).
-#   2. Load VM and media information via VBoxManage.
-#   3. Run all prechecks and choose a strategy (offline or reflink).
-#   4. Ask for confirmation, take the per-VM lock, open the journal.
-#   5. [reflink] Save the VM state (switchover begins).
-#   6. Copy the VM folder to "<dest>.relocate-tmp" and verify the copy.
-#   7. Rename the copy to "<dest>", unregister the VM at the source,
-#      register it at the target and verify the registration.
-#   8. [reflink] Start the VM at the target (switchover ends).
-#   9. Remove the source folder (or rename it with --keep-source) and
-#      close the journal.
-#   On failure after step 4: rollback (see rollback()). An interrupted run
-#   can be finished or rolled back later with the subcommand "recover".
+#   1. Resolve settings, lock the VM, check paths, media, space and state.
+#   2. Confirm the plan and obtain RAM authorization before interrupting a guest.
+#   3. Publish the journal and reserve staging. For copy, take a live
+#      snapshot and pre-copy its frozen disk chain and snapshot states.
+#   4. Save a live guest, optionally through a temporary snapshot overlay.
+#   5. Finish and verify the copy, switch registration and validate media.
+#   6. Resume the guest, release RAM, merge the temporary snapshot and
+#      clean up the source. Log progress to syslog and interactive terminals.
+#   Before switchover a failure restores the source. After the target has
+#   resumed it is authoritative; recover retries outstanding cleanup there.
 #
 # Usage:
 #   vbox-relocate list
@@ -91,7 +84,7 @@ RESULT_EMITTED=0
 RUN_ACTIVE=0
 JOURNAL_FILE=""
 LOCK_FD=""
-declare -A VMI=()
+declare -A VMI=() EXPECTED_MEDIA=()
 declare -a MED_UUID=() MED_PARENT=() MED_STATE=() MED_TYPE=() MED_LOC=() MED_KIND=()
 declare -a BLOCKERS=() WARNINGS=()
 
@@ -214,7 +207,7 @@ syslog_event() {
         SYSLOG_FAILED=1
         printf '%s\n' "vbox-relocate: syslog unavailable; using stderr" >&2
     fi
-    if [ ! -t 2 ] && [ "${priority}" != err ]; then printf '%s\n' "${message}" >&2; fi
+    if [ ! -t 2 ] && [ "${priority}" != err ] && [ "${SILENT}" != 1 ]; then printf '%s\n' "${message}" >&2; fi
 }
 
 # Normal status message. Machine-readable mode: "INFO" record.
@@ -517,7 +510,7 @@ vmi() {
 # Its normal output is sent to STDERR, so that it stays visible but cannot
 # disturb the machine-readable protocol on STDOUT.
 vbm_action() {
-    verbose "VBoxManage ${*}" >&2
+    verbose "VBoxManage ${*}"
     "${VBOXMANAGE}" "$@" >&2
 }
 
@@ -749,7 +742,7 @@ note_warning() {
 # Run all prechecks for VM_ARG and TARGET and fill the P_* variables.
 # Exits with an error listing all blocking problems.
 build_plan() {
-    local i key path_key path uuid line ver cfg cmd
+    local i key path_key path uuid ver cfg cmd
     local -a inside_idx=()
 
     BLOCKERS=(); WARNINGS=()
@@ -870,16 +863,27 @@ build_plan() {
                 block "Medium ${MED_LOC[${i}]} has a child image outside the VM folder (linked clone?): ${MED_LOC[${j}]}"
             fi
         done
-        # Shareable disks may be attached to other VMs as well.
-        case "${MED_TYPE[${i}]}" in
-            shareable*)
-                # Bracketed parts list snapshots of a VM; only VM UUIDs count.
-                line="$("${VBOXMANAGE}" showmediuminfo "${uuid}" | grep '^In use by VMs:' | sed 's/\[[^]]*\]//g' || true)"
-                if printf '%s' "${line}" | grep -o 'UUID: [0-9a-f-]*' | grep -v -q "UUID: ${P_UUID}"; then
-                    block "Shareable medium is also used by another VM: ${MED_LOC[${i}]}"
-                fi
-                ;;
-        esac
+        # VBoxManage indents each additional VM on a continuation line.
+        # The same disk/DVD can be in use by another machine even without a
+        # linked clone. Fail closed if its ownership cannot be queried.
+        local owners kind
+        case "${MED_KIND[${i}]}" in hdds) kind=disk ;; dvds) kind=dvd ;; floppies) kind=floppy ;; esac
+        if ! owners="$("${VBOXMANAGE}" showmediuminfo "${kind}" "${uuid}")"; then
+            block "Cannot check other users of medium ${uuid}"
+        elif awk -v vm="${P_UUID}" '
+            /^In use by VMs:/ { users=1 }
+            users && !/^In use by VMs:/ && !/^[[:space:]]/ { users=0 }
+            users {
+                sub(/ \[.*/, "")
+                if (match($0, /\(UUID: [[:xdigit:]-]+\)/)) {
+                    id=substr($0,RSTART+7,RLENGTH-8)
+                    if (tolower(id)!=tolower(vm)) other=1
+                }
+            }
+            END { exit !other }
+        ' <<< "${owners}"; then
+            block "Medium is also used by another VM: ${MED_LOC[${i}]}"
+        fi
     done
 
     # Media attached in the current state but stored outside the folder.
@@ -976,8 +980,7 @@ build_plan() {
         if [ "${RAM_MODE}" != off ]; then
             if ((P_RAM_EST <= 0 || P_RAM_AVAIL < P_RAM_REQ)); then
                 reason="insufficient RAM (${P_RAM_AVAIL} MiB available, ${P_RAM_REQ} MiB required)"
-            elif [ "${UID}" = 0 ] || ! command -v pkexec >/dev/null ||
-                 [ ! -x /usr/libexec/vbox-relocate/vbox-relocate-helper ]; then
+            elif ! ram_available; then
                 reason="the polkit helper is unavailable to this VM owner"
             elif [ "$(realpath -m -- "${P_SNAPFLDR}")" != "${P_SNAPFLDR}" ] ||
                  [ "${P_SNAPFLDR}" = "${P_SRC}" ]; then
@@ -1156,7 +1159,7 @@ copy_folder() {
                     progress "${pct%\%}" copy
                 fi
             done
-    elif [ "${SILENT}" -eq 1 ]; then
+    elif [ "${SILENT}" -eq 1 ] || [ ! -t 1 ]; then
         rsync -aH "${sync_flags[@]}" --sparse -- "${src}/" "${tmp}/"
     else
         rsync -aH "${sync_flags[@]}" --sparse --info=progress2 -- "${src}/" "${tmp}/"
@@ -1185,6 +1188,24 @@ verify_copy() {
     progress 100 verify
 }
 
+# Record media UUIDs and locations before unregistering. Equal counts alone
+# cannot prove that the original disk chain is registered at the new paths.
+remember_media() {
+    local i path relative
+    EXPECTED_MEDIA=()
+    for i in "${!MED_UUID[@]}"; do
+        path="${MED_LOC[${i}]}"
+        if is_below "${path}" "${P_SRC}"; then
+            relative="${path#"${P_SRC}/"}"
+        elif is_below "${path}" "${P_SRC_RAW}"; then
+            relative="${path#"${P_SRC_RAW}/"}"
+        else
+            continue
+        fi
+        EXPECTED_MEDIA["${MED_UUID[${i}]}"]="${P_DST}/${relative}"
+    done
+}
+
 # Verify that the VM is registered at the target with all media.
 verify_registration() {
     local expected_state="${1}" i moved=0 left=0
@@ -1197,9 +1218,21 @@ verify_registration() {
         err "VM state after registration is '$(vmi VMState)', expected '${expected_state}'"
         return 1
     fi
+    if [ "${expected_state}" = saved ] || [ "${expected_state}" = aborted-saved ]; then
+        local saved
+        saved="$(vmi VMStateFile)"
+        if ! is_below "${saved}" "${P_DST}" || [ ! -f "${saved}" ]; then
+            err "Saved state is missing or outside the relocated VM: ${saved}"
+            return 1
+        fi
+    fi
     load_media
     for i in "${!MED_UUID[@]}"; do
         if is_below "${MED_LOC[${i}]}" "${P_DST}"; then
+            if [ "${EXPECTED_MEDIA[${MED_UUID[${i}]}]:-}" != "${MED_LOC[${i}]}" ]; then
+                err "Unexpected registered medium: ${MED_UUID[${i}]} at ${MED_LOC[${i}]}"
+                return 1
+            fi
             moved=$((moved + 1))
         elif is_below "${MED_LOC[${i}]}" "${P_SRC}" || is_below "${MED_LOC[${i}]}" "${P_SRC_RAW}"; then
             left=$((left + 1))
@@ -1344,11 +1377,12 @@ precopy() {
     done
     manifest="${JOURNAL_FILE}.files"
     : > "${manifest}"
+    declare -A seen=()
     for key in "${!VMI[@]}"; do
         [[ "${key}" = *-ImageUUID-* ]] || continue
         child="${VMI[${key}]}"
         [ -n "${child}" ] || continue
-        local -A seen=()
+        seen=()
         while [ -n "${parents[${child}]:-}" ]; do
             parent="${parents[${child}]}"
             [[ -n "${locations[${parent}]:-}" ]] || break
@@ -1373,6 +1407,11 @@ precopy() {
     changes="$(rsync -ani "${check[@]}" --from0 --files-from="${manifest}" -- "${P_SRC}/" "${P_TMP}/")" || die "Cannot verify frozen files"
     [ -z "${changes}" ] || die "Frozen files differ after pre-copy: ${changes}"
     progress 100 precopy
+}
+
+# Only user-owned VirtualBox sessions can request the installed polkit helper.
+ram_available() {
+    [ "${UID}" != 0 ] && command -v pkexec >/dev/null && [ -x /usr/libexec/vbox-relocate/vbox-relocate-helper ]
 }
 
 # A fixed, administrator-installed executable is the only privileged entry point.
@@ -1459,7 +1498,7 @@ rollback() {
     set +e
 
     # Never touch the target copy if the source settings file is missing.
-    if [ ! -f "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
+    if ! same_dir "${J_SRC_DIR}" "${J_SRC_ID}" || [ ! -f "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
         err "Source settings file missing (${J_SRC_DIR}/${J_CFG_NAME}); manual intervention required"
         set -e
         return 1
@@ -1489,23 +1528,18 @@ rollback() {
         vbm_action registervm "${J_SRC_DIR}/${J_CFG_NAME}" || { err "Could not register the VM at the source"; ok=0; }
     fi
 
-    # 3. Remove the copy at the target (only paths this tool created).
+    # Confirm which machine is authoritative before attempting restoration.
     if ! vm_info_try "${J_VM_UUID}" || [ "$(vmi CfgFile)" != "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
         err "Source registration could not be confirmed; retaining both trees and the journal"
         return 1
     fi
-    if [ "${ok}" -eq 1 ]; then
-        if { [ "${J_STEP_RENAMED}" = "1" ] || [ -n "${J_COPY_ID}" ]; } && same_dir "${J_DST_DIR}" "${J_COPY_ID}"; then
-            rm -rf --one-file-system -- "${J_DST_DIR}" || { err "Could not remove ${J_DST_DIR}"; ok=0; }
-        fi
-        if [ "${J_STEP_COPY_STARTED}" = "1" ] && same_dir "${J_TMP_DIR}" "${J_COPY_ID}"; then
-            rm -rf --one-file-system -- "${J_TMP_DIR}" || { err "Could not remove ${J_TMP_DIR}"; ok=0; }
-        fi
-    fi
-
     # Reconstruct the source link even if savestate completed between journal writes.
     if [ "${ok}" = 1 ] && [ "${J_RAM_STAGE}" = prepare ] && [ "$(vmi VMState)" = saved ]; then
         ram_capture || { err "RAM capture incomplete; retaining the VM and mounts"; return 1; }
+    elif [ "${J_RAM_STAGE}" = prepare ] && [ "$(state_class "$(vmi VMState)")" = live ]; then
+        # A failed save may have left an upper file. Keep the guest paused
+        # until the helper confirms that detaching the overlay is safe.
+        ram_release || { err "Inspect the snapshot overlay before resuming the guest"; return 1; }
     fi
 
     # 4. Restart a VM that was running before.
@@ -1522,6 +1556,15 @@ rollback() {
 
     if [ "${ok}" = 1 ]; then ram_release || ok=0; fi
     if [ "${ok}" = 1 ]; then merge_snapshot "${J_SRC_DIR}/${J_CFG_NAME}" || ok=0; fi
+    if [ "${ok}" -eq 1 ]; then
+        if { [ "${J_STEP_RENAMED}" = "1" ] || [ -n "${J_COPY_ID}" ]; } && same_dir "${J_DST_DIR}" "${J_COPY_ID}"; then
+            rm -rf --one-file-system -- "${J_DST_DIR}" || { err "Could not remove ${J_DST_DIR}"; ok=0; }
+        fi
+        if [ "${J_STEP_COPY_STARTED}" = "1" ] && same_dir "${J_TMP_DIR}" "${J_COPY_ID}"; then
+            rm -rf --one-file-system -- "${J_TMP_DIR}" || { err "Could not remove ${J_TMP_DIR}"; ok=0; }
+        fi
+    fi
+
     set -e
     if [ "${ok}" -eq 1 ]; then
         rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
@@ -1633,6 +1676,11 @@ cmd_run() {
     build_plan
     print_plan
     confirm
+    if [ "${P_RAM_DECISION}" = ram ] && ! ram_helper authorize "${P_UUID}"; then
+        [ "${RAM_MODE}" != require ] || die "RAM setup authorization was denied"
+        P_RAM_DECISION=disk
+        warn "RAM setup was not authorized; saving the guest state to disk"
+    fi
 
     # Open the journal. From here on every failure triggers a rollback.
     JOURNAL_FILE="${STATE_DIR}/${P_UUID}.journal"
@@ -1646,23 +1694,39 @@ cmd_run() {
     J_STRATEGY="${P_STRATEGY}"
     J_ORIG_STATE="${P_STATE}"; J_START_TYPE="${P_START_TYPE}"; J_KEEP_SOURCE="${KEEP_SOURCE}"
     J_SRC_ID="$(stat -c '%d:%i' -- "${P_SRC}")"
-    : > "${JOURNAL_FILE}"
+    # Publish the initial record atomically before changing either VM tree.
+    local final_journal="${JOURNAL_FILE}"
+    JOURNAL_FILE="$(mktemp -- "${STATE_DIR}/.init.XXXXXXXX")"
     for key in J_VM_UUID J_VM_NAME J_SRC_DIR J_DST_DIR J_TMP_DIR J_CFG_NAME J_STRATEGY \
                J_ORIG_STATE J_START_TYPE J_KEEP_SOURCE J_SRC_ID; do
         journal_set "${key}" "${!key}"
     done
+    mv -T -- "${JOURNAL_FILE}" "${final_journal}"
+    JOURNAL_FILE="${final_journal}"
     RUN_ACTIVE=1
 
     mkdir -m 700 -- "${P_TMP}" || die "Could not reserve ${P_TMP}"
     J_COPY_ID="$(stat -c '%d:%i' -- "${P_TMP}")"; journal_set J_COPY_ID "${J_COPY_ID}"
     J_STEP_COPY_STARTED=1; journal_set J_STEP_COPY_STARTED 1
     if [ "${P_STRATEGY}" = copy ]; then precopy; fi
+    remember_media
+    load_vm_info "${P_UUID}"
+    if [ "$(realpath -e -- "$(vmi CfgFile)")" != "${P_SRC}/${P_CFG_NAME}" ] ||
+       [ "$(vmi VMState)" != "${P_STATE}" ] ||
+       { [ -n "${J_TEMP_UUID}" ] && [ "$(vmi CurrentSnapshotUUID)" != "${J_TEMP_UUID}" ]; }; then
+        die "VM registration, state or current snapshot changed during preparation"
+    fi
 
     # Switchover begins: save the state of a running VM.
     local expected_state="${P_STATE}"
     if [ "${P_CLASS}" = live ]; then
         step savestate "Saving the VM state (switchover begins)"
         downtime begin
+        if [ "${P_RAM_DECISION}" = ram ] && [ "$(mem_mib MemAvailable)" -lt "${P_RAM_REQ}" ]; then
+            [ "${RAM_MODE}" != require ] || die "Free RAM fell below the required reserve"
+            P_RAM_DECISION=disk
+            warn "Free RAM fell below the reserve; saving the guest state to disk"
+        fi
         if [ "${P_RAM_DECISION}" = ram ]; then ram_prepare; fi
         if ! vbm_action controlvm "${P_UUID}" savestate; then
             # If the VM still runs, nothing has changed yet.
@@ -1686,6 +1750,11 @@ cmd_run() {
     mv -Tn -- "${P_TMP}" "${P_DST}"
     same_dir "${P_DST}" "${J_COPY_ID}" || die "Destination changed while copying"
     J_STEP_RENAMED=1; journal_set J_STEP_RENAMED 1
+
+    load_vm_info "${P_UUID}"
+    if [ "$(realpath -e -- "$(vmi CfgFile)")" != "${P_SRC}/${P_CFG_NAME}" ] || [ "$(vmi VMState)" != "${expected_state}" ]; then
+        die "Source VM changed during the copy; refusing switchover"
+    fi
 
     # Re-register at the target.
     step register "Registering the VM at ${P_DST}"
@@ -1745,6 +1814,8 @@ cmd_recover() {
     fi
 
     if [ "${J_STEP_DST_STARTED}" = "1" ]; then
+        vm_info_try "${J_VM_UUID}" && [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ] ||
+            die "Cannot confirm target registration; keeping RAM, source and journal"
         info "VM '${J_VM_NAME}' is at ${J_DST_DIR}; finishing the cleanup"
         step cleanup "Cleaning up the source folder"
         ram_release || die "Could not release saved RAM; journal kept"

@@ -97,7 +97,7 @@ def snapshot_dir(uid, uuid, cfg, snap):
     return parent, lower, snap
 
 
-def prepare(uid, args, root, ram, meta, label):
+def prepare(uid, args, ram, meta, label):
     if meta.exists() or os.path.ismount(ram):
         raise ValueError("RAM operation already exists; recover it first")
     if args.mib <= 0 or args.mib > 2**31:
@@ -173,7 +173,7 @@ def operate(uid, args):
     with (root / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command == "prepare":
-            prepare(uid, args, root, ram, meta, label)
+            prepare(uid, args, ram, meta, label)
             return
         if not meta.exists():
             if args.command == "release":
@@ -204,6 +204,7 @@ def operate(uid, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("authorize", help="obtain authorization before pausing a guest").add_argument("uuid")
     setup = sub.add_parser("prepare", help="mount tmpfs and overlay before savestate")
     setup.add_argument("uuid")
     setup.add_argument("mib", type=int)
@@ -219,6 +220,8 @@ def main():
     uid = int(os.environ.get("PKEXEC_UID", "-1"))
     if uid <= 0 or os.getuid() != 0 or os.geteuid() != 0:
         parser.error("invoke through pkexec as the VM owner")
+    if args.command == "authorize":
+        return
     os.umask(0o022)
     operate(uid, args)
 
