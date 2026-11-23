@@ -1167,6 +1167,30 @@ copy_folder() {
     progress 100 copy
 }
 
+# Compare symlink resolution at the final location. A byte-for-byte copy
+# can still depend on the old source (for example an absolute disk link).
+# Staging and destination are siblings, so relative external paths resolve
+# identically there. Internal relative links must remain inside the copy.
+verify_links() {
+    local src="${1}" tmp="${2}" manifest="${3}" link old new expected
+    find "${src}" -type l -print0 > "${manifest}" || return 1
+    while IFS= read -r -d '' link; do
+        old="$(realpath -m -- "${link}")" || return 1
+        new="$(realpath -m -- "${tmp}/${link#"${src}/"}")" || return 1
+        if [ "${old}" = "${src}" ]; then
+            expected="${tmp}"
+        elif is_below "${old}" "${src}"; then
+            expected="${tmp}/${old#"${src}/"}"
+        else
+            expected="${old}"
+        fi
+        if [ "${new}" != "${expected}" ]; then
+            err "Symlink would resolve to the wrong location after relocation: ${link}"
+            return 1
+        fi
+    done < "${manifest}"
+}
+
 # Verify the copy against the source (file list and sizes, optionally
 # SHA-256 of all files).
 verify_copy() {
@@ -1183,6 +1207,7 @@ verify_copy() {
             break
         fi
     done
+    if [ "${rc}" = 0 ]; then verify_links "${src}" "${tmp}" "${work}/links" || rc=1; fi
     rm -rf -- "${work}" || return 1
     [ "${rc}" = 0 ] || return 1
     progress 100 verify

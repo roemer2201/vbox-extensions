@@ -108,3 +108,12 @@ teardown() {
     [ "${status}" = 1 ] && [[ "${stderr}" == *"Target folder already exists"* ]]
     [ -f "${src}/VM.vbox" ] && [ -L "${WORKFLOW_TARGET}/VM" ]
 }
+
+@test "offline relocation preserves source when a disk link would point into the old tree" {
+    printf '{"state":"poweroff"}' > "${src}/VM.vbox"
+    mv -- "${src}/base.vdi" "${src}/backing.vdi"
+    ln -s -- "${src}/backing.vdi" "${src}/base.vdi"
+    VBOX_RELOCATE_STRATEGY=auto run --separate-stderr "${script}" run
+    [ "${status}" = 1 ] && [[ "${stderr}" == *"Symlink would resolve"* ]]
+    [ "$(cat "${src}/base.vdi")" = base ] && [ ! -e "${WORKFLOW_TARGET}/VM" ]
+}
