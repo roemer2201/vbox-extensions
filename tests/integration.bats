@@ -17,6 +17,9 @@ setup_file() {
     if ! command -v VBoxManage >/dev/null; then
         skip "VBoxManage not installed"
     fi
+    if ! VBOX_USER_HOME="${BATS_FILE_TMPDIR}/vbox-home" VBoxManage list vms >/dev/null 2>&1; then
+        skip "VBoxSVC cannot open its IPC service on this host"
+    fi
     export BASE="${BATS_FILE_TMPDIR}"
     export VBOX_USER_HOME="${BASE}/vbox-home"
     export VBOXSIM_DIR="${BASE}/sim"
@@ -38,7 +41,7 @@ setup_file() {
 
 teardown_file() {
     local vm
-    if command -v VBoxManage >/dev/null; then
+    if [ -n "${BASE:-}" ] && command -v VBoxManage >/dev/null; then
         for vm in $("${SIM}" list vms | sed -n 's/.*{\(.*\)}$/\1/p'); do
             "${SIM}" unregistervm "${vm}" >/dev/null 2>&1 || true
         done
@@ -169,16 +172,18 @@ need_btrfs() {
     [ ! -e "${BTRFS}/vms/t-live" ]
 }
 
-@test "running VM to another file system is refused (strategy copy not implemented)" {
+@test "live cross-filesystem relocation merges only the temporary snapshot" {
     need_btrfs
-    create_vm t-nocopy "${BTRFS}/vms"
-    set_running t-nocopy
-    mkdir -p "${BASE}/ext/new-nocopy"
-    run "${SCRIPT}" run t-nocopy -t "${BASE}/ext/new-nocopy" --yes
-    [ "${status}" -eq 1 ]
-    [[ "${output}" == *"Strategy 'copy'"* ]]
-    [ "$(vm_value t-nocopy VMState)" = "running" ]
-    [ "$(vm_value t-nocopy CfgFile)" = "${BTRFS}/vms/t-nocopy/t-nocopy.vbox" ]
+    create_vm t-copy "${BTRFS}/vms"
+    set_running t-copy
+    mkdir -p "${BASE}/ext/new-copy"
+    run "${SCRIPT}" run t-copy -t "${BASE}/ext/new-copy" --yes --ram-mode off --machine-readable
+    [ "${status}" -eq 0 ]
+    [[ "${output}" == *'PLAN strategy="copy"'* ]]
+    [ "$(vm_value t-copy VMState)" = running ]
+    [ "$(vm_value t-copy SnapshotName-1)" = s2 ]
+    [ "$(vm_value t-copy CfgFile)" = "${BASE}/ext/new-copy/t-copy/t-copy.vbox" ]
+    [ ! -e "${BTRFS}/vms/t-copy" ]
 }
 
 @test "failed registration at the target rolls back to the running source" {

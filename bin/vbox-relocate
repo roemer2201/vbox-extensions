@@ -37,7 +37,7 @@
 #   vbox-relocate recover <vm>
 #   vbox-relocate --help
 #
-# Version: 0.3.0  (2026-11-23)
+# Version: 0.4.0  (2026-11-23)
 #
 # License: GPL-3.0-only (see LICENSE in the repository)
 
@@ -48,7 +48,7 @@ set -euo pipefail
 
 # --- Fixed settings ----------------------------------------------------------
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.4.0"
 
 # Name of the user configuration file (searched below ${HOME}/.config).
 CONFIG_NAME="vbox-relocate.conf"
@@ -105,8 +105,8 @@ usage() {
 Usage: vbox-relocate SUBCOMMAND [VM] [OPTIONS]
 
 Relocates the complete folder of a VirtualBox VM to another directory on the
-same host. Running VMs are moved with a switchover of a few seconds (saved
-state + btrfs reflink clone); VMs that are not running are copied.
+same host. For running VMs the switchover saves and restores the guest.
+Without reflinks, a live snapshot allows frozen disks to be copied ahead.
 
 Subcommands:
   list                 List VMs with state, folder, size and snapshot count.
@@ -126,8 +126,7 @@ Options:
                        Env: VBOX_RELOCATE_TARGET        Default: (none)
       --strategy S     auto, offline, reflink, copy.
                        auto: offline for VMs that are not running, reflink
-                       for running VMs on the same btrfs filesystem.
-                       copy is not implemented yet (planned).
+                       when cloning works, otherwise copy via a live snapshot.
                        Env: VBOX_RELOCATE_STRATEGY      Default: auto
       --ram-mode M     auto, require, off. Keep the saved state in RAM
                        (tmpfs) during the switchover. auto falls back to disk, require
@@ -726,6 +725,7 @@ journal_clear_vars() {
     J_VM_UUID=""; J_VM_NAME=""; J_SRC_DIR=""; J_DST_DIR=""; J_TMP_DIR=""
     J_CFG_NAME=""; J_STRATEGY=""; J_ORIG_STATE=""; J_START_TYPE=""
     J_KEEP_SOURCE=0; J_STEP_SAVED=0; J_STEP_COPY_STARTED=0; J_STEP_RENAMED=0
+    J_TEMP_NAME=""; J_TEMP_UUID=""
     J_RAM_STAGE=off; J_SNAP=""; J_SAV_NAME=""
     J_SRC_ID=""; J_COPY_ID=""; J_START_INTENT=0
     J_STEP_SRC_UNREGISTERED=0; J_STEP_DST_REGISTERED=0; J_STEP_DST_STARTED=0
@@ -929,7 +929,7 @@ build_plan() {
 
     choose_strategy
 
-    if [ "${P_REFLINK}" -eq 1 ]; then
+    if [ "${P_REFLINK}" -eq 1 ] && [ "${P_STRATEGY}" != copy ]; then
         P_REQUIRED="${SPACE_RESERVE_BYTES}"
     else
         P_REQUIRED=$((P_SRC_SIZE + SPACE_RESERVE_BYTES))
@@ -937,9 +937,7 @@ build_plan() {
             block "Required command not found: rsync (needed for copies without reflink)"
         fi
     fi
-    if [ -n "${P_TARGET}" ] && [ "${P_DST_FREE}" -lt "${P_REQUIRED}" ]; then
-        block "Not enough free space on the target: $(human_bytes "${P_DST_FREE}") free, $(human_bytes "${P_REQUIRED}") required"
-    fi
+
 
     # Start type for running VMs
     P_START_TYPE=""
@@ -997,6 +995,28 @@ build_plan() {
         fi
     fi
 
+    if [ "${P_CLASS}" = live ]; then
+        local sav_bytes=$((P_RAM_EST * 1024 * 1024)) src_required=0
+        if [ "${P_RAM_DECISION}" = disk ] || [ "${RAM_MODE}" = auto ] || [ "${KEEP_SOURCE}" = 1 ]; then
+            src_required="${sav_bytes}"
+            if [ "${P_STRATEGY}" = copy ]; then P_REQUIRED=$((P_REQUIRED + sav_bytes)); fi
+        fi
+        if [ "${P_STRATEGY}" = copy ]; then
+            src_required=$((src_required + sav_bytes + SPACE_RESERVE_BYTES))
+            P_REQUIRED=$((P_REQUIRED + sav_bytes))
+            for i in "${inside_idx[@]}"; do
+                case "${MED_TYPE[${i}],,}" in
+                    writethrough*|shareable*) block "Live copy cannot freeze ${MED_TYPE[${i}]} medium: ${MED_LOC[${i}]}" ;;
+                esac
+            done
+        fi
+        if [ "${P_SAME_FS}" = 1 ]; then P_REQUIRED=$((P_REQUIRED + src_required)); fi
+        if [ "$(free_bytes "${P_SRC}")" -lt "${src_required}" ]; then block "Insufficient space for saved state and snapshot growth on source"; fi
+    fi
+    if [ -n "${P_TARGET}" ] && [ "${P_DST_FREE}" -lt "${P_REQUIRED}" ]; then
+        block "Not enough free space on target: $(human_bytes "${P_DST_FREE}") free, $(human_bytes "${P_REQUIRED}") required"
+    fi
+
     if [ "${#BLOCKERS[@]}" -gt 0 ]; then
         print_plan
         report_blockers
@@ -1034,7 +1054,7 @@ choose_strategy() {
             fi
             ;;
         copy)
-            block "Strategy 'copy' (running VM, different file system) is not implemented yet (planned); save or shut down the VM and use strategy 'offline'"
+            if [ "${P_CLASS}" != live ]; then block "Strategy copy requires a running or paused VM"; fi
             ;;
     esac
 }
@@ -1094,7 +1114,7 @@ print_plan() {
     printf 'Media:         %s moved, %s kept in place\n' "${P_MEDIA_IN}" "${P_MEDIA_OUT}"
     printf 'Size:          %s (target free: %s, required: %s)\n' \
         "$(human_bytes "${P_SRC_SIZE}")" "$(human_bytes "${P_DST_FREE}")" "$(human_bytes "${P_REQUIRED:-0}")"
-    if [ "${P_STRATEGY}" = "reflink" ]; then
+    if [ "${P_CLASS}" = live ]; then
         printf 'Switchover:    save and restore about %s MiB of VM state\n' "${P_RAM_EST}"
         printf 'Start type:    %s\n' "${P_START_TYPE}"
         printf 'RAM mode:      %s (estimate %s MiB, available %s MiB, required %s MiB)\n' \
@@ -1118,15 +1138,17 @@ print_plan() {
 # possible (no data is copied); otherwise rsync copies the data.
 copy_folder() {
     local src="${1}" tmp="${2}" pct
+    local -a sync_flags=()
+    if [ "${P_STRATEGY}" = copy ]; then sync_flags=(--delete); fi
     verbose "Copy source=${src}, target=${tmp}, reflink=${P_REFLINK}"
     progress 0 copy
-    if [ "${P_REFLINK}" -eq 1 ]; then
+    if [ "${P_REFLINK}" -eq 1 ] && [ "${P_STRATEGY}" != copy ]; then
         verbose "cp -a --reflink=always ${src} ${tmp}"
         cp -a --reflink=always -- "${src}/." "${tmp}/"
     elif [ "${MACHINE_READABLE}" -eq 1 ]; then
         # rsync reports progress with carriage returns; extract the percent
         # values and forward them as PROGRESS records.
-        rsync -aH --sparse --no-inc-recursive --info=progress2 -- "${src}/" "${tmp}/" \
+        rsync -aH "${sync_flags[@]}" --sparse --no-inc-recursive --info=progress2 -- "${src}/" "${tmp}/" \
             | tr '\r' '\n' \
             | while IFS= read -r line; do
                 pct="$(printf '%s' "${line}" | grep -o '[0-9]\+%' | head -n 1 || true)"
@@ -1135,9 +1157,9 @@ copy_folder() {
                 fi
             done
     elif [ "${SILENT}" -eq 1 ]; then
-        rsync -aH --sparse -- "${src}/" "${tmp}/"
+        rsync -aH "${sync_flags[@]}" --sparse -- "${src}/" "${tmp}/"
     else
-        rsync -aH --sparse --info=progress2 -- "${src}/" "${tmp}/"
+        rsync -aH "${sync_flags[@]}" --sparse --info=progress2 -- "${src}/" "${tmp}/"
     fi
     progress 100 copy
 }
@@ -1248,6 +1270,109 @@ start_vm() {
     if [ "${orig_state}" = "paused" ] && [ "$(vmi VMState)" != "paused" ]; then
         vbm_action controlvm "${uuid}" pause || warn "Could not pause the VM again"
     fi
+}
+
+# Resolve the snapshot by our journaled, random name after a crash between
+# taking it and saving its UUID. Never delete a user's current snapshot.
+find_temp_snapshot() {
+    local key suffix
+    for key in "${!VMI[@]}"; do
+        case "${key}" in
+            SnapshotName|SnapshotName-*)
+                if [ "${VMI[${key}]}" = "${J_TEMP_NAME}" ]; then
+                    suffix="${key#SnapshotName}"
+                    vmi "SnapshotUUID${suffix}"
+                    return 0
+                fi ;;
+        esac
+    done
+}
+
+# Remove the temporary snapshot on the authoritative registration only.
+# A failed online merge is retryable without reversing the switchover.
+merge_snapshot() {
+    local cfg="${1}" found
+    [ -n "${J_TEMP_NAME}" ] || return 0
+    vm_info_try "${J_VM_UUID}" || return 1
+    [ "$(vmi CfgFile)" = "${cfg}" ] || { err "Unexpected registration while merging snapshot"; return 1; }
+    found="$(find_temp_snapshot)" || return 1
+    if [ -n "${J_TEMP_UUID}" ]; then
+        # UUID is stable even if the snapshot was renamed. Absence means a
+        # previous merge completed before the journal was updated.
+        local key match=0
+        for key in "${!VMI[@]}"; do
+            case "${key}" in SnapshotUUID|SnapshotUUID-*) [ "${VMI[${key}]}" != "${J_TEMP_UUID}" ] || match=1 ;; esac
+        done
+        if [ "${match}" = 0 ]; then found=""; else found="${J_TEMP_UUID}"; fi
+    fi
+    if [ -n "${found}" ]; then
+        step snapshot-delete "Merging temporary snapshot ${found}"
+        vbm_action snapshot "${J_VM_UUID}" delete "${found}" || {
+            warn "Snapshot merge incomplete; keep the journal and retry recover for ${J_VM_UUID}"
+            return 1
+        }
+    fi
+    J_TEMP_NAME=""; journal_set J_TEMP_NAME ""
+}
+
+# Walk the registered ancestry of active hard disks. Only immutable parents
+# are eligible for pre-copy. Unregistered extents and auxiliary files are
+# transferred once the VM is saved. NUL delimiters preserve literal names.
+precopy() {
+    local key child parent loc index id manifest changes
+    local -A parents=() locations=()
+    local -a check=(--size-only)
+    J_TEMP_NAME="vbox-relocate-$(cat /proc/sys/kernel/random/uuid)"
+    journal_set J_TEMP_NAME "${J_TEMP_NAME}"
+    step snapshot-take "Taking live snapshot ${J_TEMP_NAME}"
+    vbm_action snapshot "${P_UUID}" take "${J_TEMP_NAME}" --live || die "Live snapshot failed"
+    load_vm_info "${P_UUID}"
+    J_TEMP_UUID="$(find_temp_snapshot)"
+    [[ -n "${J_TEMP_UUID}" && "${J_TEMP_UUID}" = "$(vmi CurrentSnapshotUUID)" ]] || die "Cannot identify the new live snapshot"
+    journal_set J_TEMP_UUID "${J_TEMP_UUID}"
+    load_media
+    # A live snapshot creates new disks; registration must verify the
+    # post-snapshot media population, including the new writable children.
+    P_MEDIA_IN=0
+    for index in "${!MED_UUID[@]}"; do
+        loc="${MED_LOC[${index}]}"
+        if is_below "${loc}" "${P_SRC}" || is_below "${loc}" "${P_SRC_RAW}"; then P_MEDIA_IN=$((P_MEDIA_IN+1)); fi
+        [ "${MED_KIND[${index}]}" = hdds ] || continue
+        id="${MED_UUID[${index}]}"
+        parents["${id}"]="${MED_PARENT[${index}]}"
+        locations["${id}"]="${loc}"
+    done
+    manifest="${JOURNAL_FILE}.files"
+    : > "${manifest}"
+    for key in "${!VMI[@]}"; do
+        [[ "${key}" = *-ImageUUID-* ]] || continue
+        child="${VMI[${key}]}"
+        [ -n "${child}" ] || continue
+        local -A seen=()
+        while [ -n "${parents[${child}]:-}" ]; do
+            parent="${parents[${child}]}"
+            [[ -n "${locations[${parent}]:-}" ]] || break
+            [[ -z "${seen[${parent}]:-}" ]] || die "Cycle in disk parent chain"
+            seen["${parent}"]=1
+            loc="${locations[${parent}]}"
+            if is_below "${loc}" "${P_SRC}"; then printf '%s\0' "${loc#"${P_SRC}/"}" >> "${manifest}"; fi
+            child="${parent}"
+        done
+    done
+    # Historical saved states, including the live snapshot just taken, are
+    # immutable. Never include the final savestate or an active disk leaf.
+    if [ "${P_SNAPFLDR}" = "${P_SRC}" ]; then
+        (cd -- "${P_SRC}" && find . -type f -name '*.sav' -print0) >> "${manifest}"
+    elif [ -d "${P_SNAPFLDR}" ]; then
+        (cd -- "${P_SRC}" && find "./${P_SNAPFLDR#"${P_SRC}/"}" -type f -name '*.sav' -print0) >> "${manifest}"
+    fi
+    step precopy "Copying frozen images and snapshot states while the guest is live"
+    progress 0 precopy
+    rsync -aHS --from0 --files-from="${manifest}" -- "${P_SRC}/" "${P_TMP}/"
+    if [ "${VERIFY}" = checksum ]; then check=(--checksum); fi
+    changes="$(rsync -ani "${check[@]}" --from0 --files-from="${manifest}" -- "${P_SRC}/" "${P_TMP}/")" || die "Cannot verify frozen files"
+    [ -z "${changes}" ] || die "Frozen files differ after pre-copy: ${changes}"
+    progress 100 precopy
 }
 
 # A fixed, administrator-installed executable is the only privileged entry point.
@@ -1396,9 +1521,10 @@ rollback() {
     fi
 
     if [ "${ok}" = 1 ]; then ram_release || ok=0; fi
+    if [ "${ok}" = 1 ]; then merge_snapshot "${J_SRC_DIR}/${J_CFG_NAME}" || ok=0; fi
     set -e
     if [ "${ok}" -eq 1 ]; then
-        rm -f -- "${JOURNAL_FILE}"
+        rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
         info "Rollback finished; the VM is at ${J_SRC_DIR} again"
         return 0
     fi
@@ -1527,9 +1653,14 @@ cmd_run() {
     done
     RUN_ACTIVE=1
 
+    mkdir -m 700 -- "${P_TMP}" || die "Could not reserve ${P_TMP}"
+    J_COPY_ID="$(stat -c '%d:%i' -- "${P_TMP}")"; journal_set J_COPY_ID "${J_COPY_ID}"
+    J_STEP_COPY_STARTED=1; journal_set J_STEP_COPY_STARTED 1
+    if [ "${P_STRATEGY}" = copy ]; then precopy; fi
+
     # Switchover begins: save the state of a running VM.
     local expected_state="${P_STATE}"
-    if [ "${P_STRATEGY}" = "reflink" ]; then
+    if [ "${P_CLASS}" = live ]; then
         step savestate "Saving the VM state (switchover begins)"
         downtime begin
         if [ "${P_RAM_DECISION}" = ram ]; then ram_prepare; fi
@@ -1549,9 +1680,6 @@ cmd_run() {
 
     # Copy and verify.
     step copy "Copying ${P_SRC} to ${P_TMP}"
-    mkdir -m 700 -- "${P_TMP}" || die "Could not reserve ${P_TMP}"
-    J_COPY_ID="$(stat -c '%d:%i' -- "${P_TMP}")"; journal_set J_COPY_ID "${J_COPY_ID}"
-    J_STEP_COPY_STARTED=1; journal_set J_STEP_COPY_STARTED 1
     copy_folder "${P_SRC}" "${P_TMP}"
     step verify "Verifying the copy (${VERIFY})"
     verify_copy "${P_SRC}" "${P_TMP}" || die "Verification of the copy failed"
@@ -1569,7 +1697,7 @@ cmd_run() {
     verify_registration "${expected_state}" || die "Verification of the registration failed"
 
     # Switchover ends: start the VM at the target.
-    if [ "${P_STRATEGY}" = "reflink" ]; then
+    if [ "${P_CLASS}" = live ]; then
         step start "Starting the VM at the target (${P_START_TYPE})"
         J_START_INTENT=1; journal_set J_START_INTENT 1
         start_vm "${P_UUID}" "${P_START_TYPE}" "${P_STATE}" || die "Could not start the VM at the target"
@@ -1581,12 +1709,13 @@ cmd_run() {
     step cleanup "Cleaning up the source folder"
     RUN_ACTIVE=0
     ram_release || die "Could not release saved RAM; finish with recover"
+    merge_snapshot "${P_DST}/${P_CFG_NAME}" || die "Target is authoritative; retry recover to finish the merge"
     if ! cleanup_source "${P_SRC}" "${P_DST}" "${P_CFG_NAME}" "${P_UUID}" "${KEEP_SOURCE}"; then
         err "Relocation succeeded, but the source could not be cleaned up; finish with: ${SCRIPT_NAME} recover ${P_UUID}"
         result failed
         exit 1
     fi
-    rm -f -- "${JOURNAL_FILE}"
+    rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
     info "VM '${P_NAME}' relocated to ${P_DST}"
     result ok
 }
@@ -1619,9 +1748,10 @@ cmd_recover() {
         info "VM '${J_VM_NAME}' is at ${J_DST_DIR}; finishing the cleanup"
         step cleanup "Cleaning up the source folder"
         ram_release || die "Could not release saved RAM; journal kept"
+        merge_snapshot "${J_DST_DIR}/${J_CFG_NAME}" || die "Target snapshot cleanup pending"
         cleanup_source "${J_SRC_DIR}" "${J_DST_DIR}" "${J_CFG_NAME}" "${J_VM_UUID}" "${J_KEEP_SOURCE}" \
             || die "Cleanup failed; journal kept: ${JOURNAL_FILE}"
-        rm -f -- "${JOURNAL_FILE}"
+        rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
         result ok
         return 0
     fi

@@ -20,7 +20,7 @@
 # Usage:
 #   VBOXSIM_DIR=/tmp/sim vboxmanage-sim <VBoxManage arguments>
 #
-# Version: 0.1.0  (2026-11-22)
+# Version: 0.2.0  (2026-11-23)
 
 set -euo pipefail
 
@@ -61,6 +61,14 @@ case "${cmd}" in
             printf '%s\n' "${out}"
         fi
         ;;
+    snapshot)
+        # Let the real registry create and merge the disk chain. The test VM
+        # has no live frontend, so only the simulated take omits --live.
+        if [ "${3:-}" = take ] && [ "${5:-}" = --live ] && is_running "$(uuid_of "${2}")"; then
+            real snapshot "${2}" take "${4}"
+        else
+            real "$@"
+        fi ;;
     controlvm)
         uuid="$(uuid_of "${2}")"
         if [ "${3:-}" = "savestate" ]; then
