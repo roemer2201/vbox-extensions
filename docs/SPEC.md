@@ -144,7 +144,7 @@ Snapshot-Ordner (Abschnitt 7).
 | Komponente | Sprache | Aufgabe |
 |------------|---------|---------|
 | `vbox-relocate` | Bash | Gesamte Logik: Prüfungen, Strategiewahl, Ablauf, Rückfall, Fortschritt. |
-| `vbox-relocate-helper` | Bash | Nur privilegierte Schritte (Mounts). Strikte Eingabeprüfung. |
+| `vbox-relocate-helper` | Python 3 | Nur privilegierte Schritte (Mounts). Strikte Eingabeprüfung. |
 | polkit-Policy | XML | Freigabe des Helfers. |
 | `vbox-relocate-gui` | Python/PySide6 | Bedienoberfläche. Enthält keine Umzugslogik, ruft nur die CLI auf. |
 
@@ -232,7 +232,7 @@ Laden des RAM-Zustands.
 
 ### 6.5 Strategie `copy` (laufende VM, anderes Dateisystem)
 
-Für spätere Umzüge auf andere Dateisysteme. Idee: Ein temporärer Snapshot macht
+Für Umzüge auf andere Dateisysteme. Ein temporärer Snapshot macht
 alle vorhandenen Images schreibgeschützt; diese werden kopiert, während die VM
 läuft. In der Umschaltphase wird nur der kleine Rest kopiert.
 
@@ -242,13 +242,12 @@ läuft. In der Umschaltphase wird nur der kleine Rest kopiert.
    Danach sind alle bisherigen Images (auch die bestehender Snapshots)
    schreibgeschützt; neue Schreibzugriffe gehen in neue Differenz-Images.
    Die dabei entstehende Snapshot-`.sav` wird ebenfalls nicht mehr verändert.
-3. **Vorkopie bei laufender VM:** alle Dateien des VM-Ordners außer
-   - den aktuellen (beschreibbaren) Differenz-Images,
-   - `.vbox`, `.vbox-prev`, `.nvram`,
-   - `Logs/`
-   nach `<Ziel>/<Ordnername>.relocate-tmp` kopieren
-   (`rsync -a --sparse --info=progress2`; Werkzeug wird im Prototyp final
-   festgelegt).
+3. **Vorkopie bei laufender VM:** Die CLI verfolgt die Eltern-UUIDs der
+   aktuell angeschlossenen Festplatten. Sie kopiert die eingefrorenen Images
+   im VM-Ordner und vorhandene Snapshot-`.sav`-Dateien mit einer
+   nullterminierten Dateiliste für rsync. Die aktiven Differenz-Images,
+   die Konfiguration, Logs sowie nicht separat registrierte Image-Bestandteile
+   folgen beim Restabgleich.
 4. Vorkopie prüfen (Abschnitt 6.6).
 5. *[RAM-Modus]* overlay einrichten (R1-R2).
 6. **Beginn Umschaltphase:** `savestate`.
@@ -265,7 +264,7 @@ läuft. In der Umschaltphase wird nur der kleine Rest kopiert.
 Hinweis: Die Dauer der Umschaltphase hängt hier von der Datenmenge ab, die der
 Gast zwischen Schritt 2 und 6 geschrieben hat.
 
-Offener Punkt: Im RAM-Modus wird bei dieser Strategie in Version 1 nur die
+Im RAM-Modus wird bei dieser Strategie in Version 1 nur die
 **finale** `.sav` (Schritt 6) im tmpfs abgelegt. Die `.sav` des temporären
 Snapshots (Schritt 2) geht auf die Platte, weil sonst auch die neuen
 Differenz-Images im tmpfs landen und dort während der gesamten Vorkopie wachsen
@@ -321,13 +320,13 @@ Zusätzliche Hinweise in der Planausgabe:
 
 | Schritt | Aktion | Ausführung |
 |---------|--------|------------|
-| R1 | tmpfs mit `size=<benoetigt>` unter `/run/vbox-relocate/<uuid>/ram` einhängen, Eigentümer = Benutzer. | Helfer |
+| R1 | Nach Autorisierung und Pausieren der VM tmpfs mit der geschätzten Zustandsgröße unter `/run/vbox-relocate/<uid>/<uuid>/ram` einhängen. Die Laufzeitverzeichnisse verwaltet root. | Helfer |
 | R2 | overlayfs über den Snapshot-Ordner: `lowerdir=<SnapFldr>`, `upperdir`/`workdir` im tmpfs. Vorhandene Dateien bleiben sichtbar, **neue** Dateien landen im tmpfs. | Helfer |
 | (savestate) | VirtualBox schreibt die `.sav` -> landet im tmpfs. | CLI |
-| R3 | Prüfen: `upperdir` enthält **genau eine** neue `.sav` und sonst nichts (keine kopierten Differenz-Images). Sonst Abbruch mit Rückfall. | CLI |
-| R4 | `.sav` innerhalb des tmpfs aus dem `upperdir` in `/run/vbox-relocate/<uuid>/ram/state/` verschieben (Umbenennung, kein Kopieren). | Helfer |
-| R5 | overlay lösen. Der Snapshot-Ordner ist wieder reines btrfs. | Helfer |
-| R6 | Im Quell-Snapshot-Ordner Symlink `<name>.sav -> /run/vbox-relocate/<uuid>/ram/state/<name>.sav` anlegen. Damit ist die Quelle weiterhin startbar (Rückfall), und die Kopie übernimmt den Symlink. | CLI |
+| R3 | Im privaten Upper-Verzeichnis muss genau die von VirtualBox gemeldete reguläre `.sav` liegen. Unerwartete Änderungen erhalten Overlay und Journal zur Prüfung. | Helfer |
+| R4 | Overlay lösen und den ursprünglichen Snapshot-Ordner freigeben. | Helfer |
+| R5 | Die geprüfte `.sav` innerhalb des tmpfs nach `ram/state/` umbenennen. | Helfer |
+| R6 | Im Quell-Snapshot-Ordner den Symlink zur Datei in `ram/state/` anlegen. Die Kopie übernimmt den Symlink. | CLI |
 | (start) | VirtualBox liest die `.sav` über den Symlink und löscht danach den Symlink (G9). | CLI |
 | R7 | tmpfs-Datei löschen, tmpfs lösen. | Helfer |
 
@@ -443,21 +442,15 @@ Schritt-IDs (Auswahl): `precheck`, `snapshot-take`, `precopy`, `ram-setup`,
 - polkit-Aktion: `io.github.roemer2201.vboxrelocate.helper`
   (Standard: `auth_admin_keep`; optional eine `rules.d`-Regel, die aktiven
   lokalen Sitzungen der Gruppe `vboxusers` die Aktion ohne Passwort erlaubt).
-- Erlaubte Unterbefehle (abschließende Liste):
-
-| Unterbefehl | Aktion |
-|-------------|--------|
-| `ram-setup <uuid> <bytes>` | tmpfs unter `/run/vbox-relocate/<uuid>/ram` für `PKEXEC_UID` einhängen. |
-| `overlay-mount <uuid> <snapfldr>` | overlayfs über den Snapshot-Ordner. |
-| `overlay-move-sav <uuid>` | Einzige `.sav` aus `upperdir` nach `state/` verschieben. |
-| `overlay-umount <uuid>` | overlay lösen. |
-| `ram-teardown <uuid>` | tmpfs lösen und Verzeichnis entfernen. |
-
-- Eingabeprüfung: UUID-Format; `<snapfldr>` wird kanonisiert, muss ein
-  Verzeichnis sein, `PKEXEC_UID` gehören und der Snapshot-Ordner einer
-  `.vbox`-Datei desselben Benutzers sein (genaues Prüfverfahren wird im
-  Prototyp festgelegt). Keine beliebigen Pfade, keine Shell-Auswertung von
-  Argumenten.
+- `authorize <uuid>` fragt die Autorisierung vor der Gastpause ab.
+- `prepare <uuid> <MiB> <cfg> <snap>` prüft Maschinen-UUID und Snapshot-Pfad
+  in der angegebenen benutzereigenen `.vbox` mit den Rechten des Aufrufers.
+  Der Helfer hält die Verzeichnisse per Dateideskriptor fest und richtet tmpfs
+  und Overlay mit `nosuid,nodev,noexec` ein.
+- `capture <uuid> <sav-Basisname>` prüft das Upper-Verzeichnis, löst das
+  zugehörige Overlay und verschiebt die Zustandsdatei innerhalb des tmpfs.
+- `release <uuid>` gibt die eigenen Mounts frei. Der Helfer leitet den
+  Laufzeitpfad aus `PKEXEC_UID` und UUID ab und serialisiert die Aktionen.
 
 ---
 
@@ -492,7 +485,7 @@ Die GUI enthält keine eigene Umzugslogik und ruft VirtualBox nicht direkt auf.
 README.md
 docs/SPEC.md                         # dieses Dokument
 bin/vbox-relocate                    # CLI (Bash)
-libexec/vbox-relocate-helper         # Root-Helfer (Bash)
+libexec/vbox-relocate-helper         # Root-Helfer (Python 3)
 polkit/io.github.roemer2201.vboxrelocate.policy
 gui/vbox_relocate_gui/               # PySide6-Anwendung
 gui/vbox-relocate-gui.desktop
@@ -508,9 +501,12 @@ packaging/                           # spaeter: .deb
 
 ## 13. Tests
 
-In der Entwicklungsumgebung (Container) gibt es kein VirtualBox. Dort laufen nur
-Syntax- und Unit-Tests (`bash -n`, `shellcheck`, bats für Parser und
-Berechnungen). Integrationstests laufen auf einem echten Host.
+Die Unit- und Workflow-Tests verwenden echte Dateisysteme, rsync und ein
+simuliertes VBoxManage. Sie decken Rückfall und Wiederaufnahme ab.
+`tests/integration.bats` benötigt VBoxSVC und nutzt für laufende Maschinen
+einen simulierten Gast. `tests/ram-mounts.bats` prüft den installierten
+polkit-Helfer mit echten Mounts auf einem Linux-Testhost.
+Die Abnahme mit laufendem Gast unter VirtualBox 7.2 ist gesondert offen.
 
 | # | Testfall |
 |---|----------|
@@ -551,10 +547,10 @@ Berechnungen). Integrationstests laufen auf einem echten Host.
 | Phase | Inhalt | Ergebnis |
 |-------|--------|----------|
 | 0 | Spezifikation (dieses Dokument) | `docs/SPEC.md` |
-| 1 | CLI: `list`, `plan`, Vorprüfungen, Strategien `offline` und `reflink` (ohne RAM-Modus), Rückfall, Journal | **umgesetzt** (`bin/vbox-relocate` 0.1.0), Host-Test ausstehend |
-| 2 | RAM-Modus: Helfer, polkit, overlay/tmpfs | Umschaltphase ohne Platten-Schreibzugriffe |
+| 1 | CLI: `list`, `plan`, `run`, `recover`, Vorprüfungen, Strategien `offline` und `reflink` (ohne RAM-Modus), Rückfall, Journal | **umgesetzt** (CLI, Reviewkorrekturen integriert), Host-Test ausstehend |
+| 2 | RAM-Modus: Helfer, polkit, overlay/tmpfs | **umgesetzt**, Hostprüfung von Overlay und Wiederherstellung ausstehend |
 | 3 | GUI (PySide6) | Bedienung mit Fortschrittsanzeige |
-| 4 | Strategie `copy` (anderes Dateisystem) | Umzug auf beliebige Dateisysteme |
+| 4 | Strategie `copy` (anderes Dateisystem) | **umgesetzt**, Live-Snapshot und Online-Merge mit echtem Gast zu prüfen |
 | 5 | Paketierung (.deb), Dokumentation | Installation per apt |
 
 ---
