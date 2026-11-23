@@ -37,7 +37,7 @@
 #   vbox-relocate recover <vm>
 #   vbox-relocate --help
 #
-# Version: 0.1.0  (2026-11-22)
+# Version: 0.1.1  (2026-11-23)
 #
 # License: GPL-3.0-only (see LICENSE in the repository)
 
@@ -48,7 +48,7 @@ set -euo pipefail
 
 # --- Fixed settings ----------------------------------------------------------
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.1.1"
 
 # Name of the user configuration file (searched below ${HOME}/.config).
 CONFIG_NAME="vbox-relocate.conf"
@@ -330,8 +330,7 @@ load_config() {
 
     for f in "${files[@]}"; do
         if [ -r "${f}" ]; then
-            verbose "Loading user configuration: ${f}"
-            # shellcheck source=/dev/null
+                # shellcheck source=/dev/null
             . "${f}"
             break
         fi
@@ -614,14 +613,15 @@ fs_type() {
 # A tiny probe file is cloned; cp's error output is suppressed because a
 # failure is an expected answer here, not an error.
 reflink_works() {
-    local probe_src="${1}/.vbox-relocate-probe.$$" probe_dst="${2}/.vbox-relocate-probe.$$" rc=1
-    if ! printf 'probe' > "${probe_src}"; then
-        return 1
+    local probe_src probe_dst rc=1
+    probe_src="$(mktemp -- "${1}/.vbox-relocate.XXXXXXXX")" || return 1
+    if probe_dst="$(mktemp -- "${2}/.vbox-relocate.XXXXXXXX")"; then
+        if printf 'probe' > "${probe_src}" && cp --reflink=always -- "${probe_src}" "${probe_dst}" 2>/dev/null; then
+            rc=0
+        fi
+        rm -f -- "${probe_dst}"
     fi
-    if cp --reflink=always -- "${probe_src}" "${probe_dst}" 2>/dev/null; then
-        rc=0
-    fi
-    rm -f -- "${probe_src}" "${probe_dst}"
+    rm -f -- "${probe_src}"
     return "${rc}"
 }
 
@@ -652,10 +652,10 @@ mem_mib() {
 # and are therefore not compared.
 tree_listing() {
     ( cd -- "${1}" && find . -mindepth 1 \
-        \( -type f -printf 'f\t%P\t%s\n' \) -o \
-        \( -type l -printf 'l\t%P\t%l\n' \) -o \
-        \( -type d -printf 'd\t%P\n' \) -o \
-        -printf '?\t%P\n' ) | LC_ALL=C sort
+        \( -type f -printf 'f\t%P\t%s\0' \) -o \
+        \( -type l -printf 'l\t%P\t%l\0' \) -o \
+        \( -type d -printf 'd\t%P\0' \) -o \
+        -printf '?\t%P\0' ) | LC_ALL=C sort -z
 }
 
 # SHA-256 of all regular files of a tree, sorted by path.
@@ -685,7 +685,7 @@ journal_set() {
 # Find the journal of a VM given by UUID or name. Prints the path.
 find_journal() {
     local vm="${1}" f name
-    if [ -f "${STATE_DIR}/${vm}.journal" ]; then
+    if [[ "${vm}" != */* ]] && [ -f "${STATE_DIR}/${vm}.journal" ]; then
         printf '%s' "${STATE_DIR}/${vm}.journal"
         return 0
     fi
@@ -706,6 +706,7 @@ journal_clear_vars() {
     J_VM_UUID=""; J_VM_NAME=""; J_SRC_DIR=""; J_DST_DIR=""; J_TMP_DIR=""
     J_CFG_NAME=""; J_STRATEGY=""; J_ORIG_STATE=""; J_START_TYPE=""
     J_KEEP_SOURCE=0; J_STEP_SAVED=0; J_STEP_COPY_STARTED=0; J_STEP_RENAMED=0
+    J_SRC_ID=""; J_COPY_ID=""; J_START_INTENT=0
     J_STEP_SRC_UNREGISTERED=0; J_STEP_DST_REGISTERED=0; J_STEP_DST_STARTED=0
 }
 
@@ -743,7 +744,7 @@ build_plan() {
 
     ver="$(vbox_version)"
     if [ "${ver}" != "7.2" ]; then
-        note_warning "VirtualBox ${ver} detected; this tool is tested with 7.2"
+        note_warning "VirtualBox ${ver} detected; the target version is 7.2"
     fi
 
     # VM information
@@ -756,6 +757,12 @@ build_plan() {
     P_CFG_NAME="$(basename -- "${cfg}")"
     P_SRC_RAW="$(dirname -- "${cfg}")"
     P_SRC="$(realpath -e -- "${P_SRC_RAW}")"
+    [[ "${P_UUID}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid machine UUID from VBoxManage"
+    [[ "${cfg}" = /* && -f "${cfg}" && ! -L "${cfg}" ]] || die "Invalid VM settings path: ${cfg}"
+    src_is_dedicated "${P_SRC}" "${P_CFG_NAME}" || die "A dedicated VM folder is required: ${P_SRC}"
+    if is_below "$(realpath -m -- "${STATE_DIR}")/journal" "${P_SRC}"; then
+        block "Journal directory must be outside the VM folder"
+    fi
     P_SNAPFLDR="$(vmi SnapFldr)"
     P_SESSION="$(vmi SessionName)"
     P_MEMORY="$(vmi memory)"
@@ -809,10 +816,10 @@ build_plan() {
             block "VM is already located in ${P_TARGET}"
         elif is_below "${P_DST}" "${P_SRC}"; then
             block "Target must not be inside the VM folder: ${P_DST}"
-        elif [ -e "${P_DST}" ]; then
+        elif [ -e "${P_DST}" ] || [ -L "${P_DST}" ]; then
             block "Target folder already exists: ${P_DST}"
         fi
-        if [ -e "${P_TMP}" ]; then
+        if [ -e "${P_TMP}" ] || [ -L "${P_TMP}" ]; then
             block "Leftover temporary folder exists: ${P_TMP} (run 'recover' or remove it)"
         fi
     fi
@@ -1079,7 +1086,7 @@ copy_folder() {
     progress 0 copy
     if [ "${P_REFLINK}" -eq 1 ]; then
         verbose "cp -a --reflink=always ${src} ${tmp}"
-        cp -a --reflink=always -- "${src}" "${tmp}"
+        cp -a --reflink=always -- "${src}/." "${tmp}/"
     elif [ "${MACHINE_READABLE}" -eq 1 ]; then
         # rsync reports progress with carriage returns; extract the percent
         # values and forward them as PROGRESS records.
@@ -1102,21 +1109,21 @@ copy_folder() {
 # Verify the copy against the source (file list and sizes, optionally
 # SHA-256 of all files).
 verify_copy() {
-    local src="${1}" tmp="${2}" diff_out
+    local src="${1}" tmp="${2}" work fn rc=0
+    work="$(mktemp -d -- "${STATE_DIR}/verify.XXXXXXXX")" || return 1
     progress 0 verify
-    if ! diff_out="$(diff <(tree_listing "${src}") <(tree_listing "${tmp}"))"; then
-        err "Copy differs from the source:"
-        printf '%s\n' "${diff_out}" | head -n 20 >&2
-        return 1
-    fi
-    if [ "${VERIFY}" = "checksum" ]; then
-        progress 50 verify
-        if ! diff_out="$(diff <(tree_checksums "${src}") <(tree_checksums "${tmp}"))"; then
-            err "Checksums of the copy differ from the source:"
-            printf '%s\n' "${diff_out}" | head -n 20 >&2
-            return 1
+    for fn in tree_listing tree_checksums; do
+        if [ "${fn}" = tree_checksums ] && [ "${VERIFY}" != checksum ]; then break; fi
+        if ! "${fn}" "${src}" > "${work}/source" ||
+           ! "${fn}" "${tmp}" > "${work}/target" ||
+           ! cmp -- "${work}/source" "${work}/target" >&2; then
+            err "Could not verify ${fn} for ${src} and ${tmp}"
+            rc=1
+            break
         fi
-    fi
+    done
+    rm -rf -- "${work}" || return 1
+    [ "${rc}" = 0 ] || return 1
     progress 100 verify
 }
 
@@ -1146,6 +1153,27 @@ verify_registration() {
     fi
 }
 
+# A VM stored directly in a home, a shared VM directory or above another
+# mount cannot be safely removed recursively. Repeat immediately before cleanup.
+src_is_dedicated() {
+    local src="${1}" cfg="${2}" others mounts item
+    [[ -d "${src}" && ! -L "${src}" && "${src}" != / && "${src}" != "${HOME}" && "${src%/*}" != "" ]] || return 1
+    others="$(find "${src}" -name '*.vbox' ! -path "${src}/${cfg}" -print -quit)" || return 1
+    [ -z "${others}" ] || return 1
+    mounts="$(findmnt -rn -o TARGET)" || return 1
+    while IFS= read -r item; do
+        printf -v item '%b' "${item}"
+        if [ "${item}" = "${src}" ] || is_below "${item}" "${src}"; then return 1; fi
+    done <<< "${mounts}"
+    return 0
+}
+
+# Check the inode recorded when we acquired a directory. Empty IDs only
+# occur in journals from version 0.1.0.
+same_dir() {
+    [[ -d "${1}" && ! -L "${1}" ]] && { [ -z "${2}" ] || [ "$(stat -c '%d:%i' -- "${1}")" = "${2}" ]; }
+}
+
 # Remove or keep the source folder after a successful relocation. Several
 # safety checks guard the recursive removal.
 cleanup_source() {
@@ -1154,17 +1182,8 @@ cleanup_source() {
         verbose "Source folder already gone: ${src}"
         return 0
     fi
-    if [ "${keep}" -eq 1 ]; then
-        kept="${src}${KEEP_SUFFIX}-$(date +%Y%m%d-%H%M%S)"
-        mv -- "${src}" "${kept}"
-        info "Source folder kept as ${kept}"
-        return 0
-    fi
-    # Safety checks before "rm -rf": a real VM folder, not a top-level or
-    # home directory, and the VM is now registered at the target.
-    if [ -z "${src}" ] || [ "${src}" = "/" ] || [ "${src}" = "${HOME}" ] || \
-       [ "$(dirname -- "${src}")" = "/" ]; then
-        err "Refusing to remove '${src}'"
+    if ! same_dir "${src}" "${J_SRC_ID}" || ! src_is_dedicated "${src}" "${cfg_name}"; then
+        err "Refusing to clean up changed or shared directory: ${src}"
         return 1
     fi
     if [ ! -f "${src}/${cfg_name}" ]; then
@@ -1175,7 +1194,13 @@ cleanup_source() {
         err "Refusing to remove '${src}': VM is not registered at ${dst}"
         return 1
     fi
-    rm -rf --one-file-system -- "${src}"
+    if [ "${keep}" -eq 1 ]; then
+        kept="${src}${KEEP_SUFFIX}-$(date +%Y%m%d-%H%M%S)"
+        mv -Tn -- "${src}" "${kept}" && [ ! -e "${src}" ] || return 1
+        info "Source folder kept as ${kept}"
+        return 0
+    fi
+    rm -rf --one-file-system -- "${src}" || return 1
     info "Source folder removed: ${src}"
 }
 
@@ -1209,6 +1234,10 @@ rollback() {
        [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ]; then
         case "$(state_class "$(vmi VMState)")" in
             offline)
+                if [ "${J_START_INTENT}" = 1 ] && [ "$(vmi VMState)" != saved ]; then
+                    err "The target may have run since switchover; preserving both copies and the journal"
+                    return 1
+                fi
                 vbm_action unregistervm "${J_VM_UUID}" || { err "Could not unregister the VM at the target"; ok=0; }
                 ;;
             *)
@@ -1225,19 +1254,26 @@ rollback() {
     fi
 
     # 3. Remove the copy at the target (only paths this tool created).
+    if ! vm_info_try "${J_VM_UUID}" || [ "$(vmi CfgFile)" != "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
+        err "Source registration could not be confirmed; retaining both trees and the journal"
+        return 1
+    fi
     if [ "${ok}" -eq 1 ]; then
-        if [ "${J_STEP_RENAMED}" = "1" ] && [ -d "${J_DST_DIR}" ]; then
+        if { [ "${J_STEP_RENAMED}" = "1" ] || [ -n "${J_COPY_ID}" ]; } && same_dir "${J_DST_DIR}" "${J_COPY_ID}"; then
             rm -rf --one-file-system -- "${J_DST_DIR}" || { err "Could not remove ${J_DST_DIR}"; ok=0; }
         fi
-        if [ "${J_STEP_COPY_STARTED}" = "1" ] && [ -d "${J_TMP_DIR}" ]; then
+        if [ "${J_STEP_COPY_STARTED}" = "1" ] && same_dir "${J_TMP_DIR}" "${J_COPY_ID}"; then
             rm -rf --one-file-system -- "${J_TMP_DIR}" || { err "Could not remove ${J_TMP_DIR}"; ok=0; }
         fi
     fi
 
     # 4. Restart a VM that was running before.
     if [ "${ok}" -eq 1 ] && [ "$(state_class "${J_ORIG_STATE}")" = "live" ]; then
-        if vm_info_try "${J_VM_UUID}" && [ "$(vmi VMState)" = "saved" ]; then
+        if [ "$(vmi VMState)" = "saved" ]; then
             start_vm "${J_VM_UUID}" "${J_START_TYPE}" "${J_ORIG_STATE}" || { err "Could not restart the VM at the source"; ok=0; }
+        elif [ "$(state_class "$(vmi VMState)")" != live ]; then
+            err "Unexpected source state: $(vmi VMState)"
+            ok=0
         fi
     fi
 
@@ -1343,10 +1379,15 @@ confirm() {
 # Subcommand "run".
 cmd_run() {
     step precheck "Checking VM '${VM_ARG}' and target '${TARGET}'"
+    load_vm_info "${VM_ARG}"
+    local locked_uuid
+    locked_uuid="$(vmi UUID)"
+    [[ "${locked_uuid}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid VM UUID"
+    take_lock "${locked_uuid}"
+    VM_ARG="${locked_uuid}"
     build_plan
     print_plan
     confirm
-    take_lock "${P_UUID}"
 
     # Open the journal. From here on every failure triggers a rollback.
     JOURNAL_FILE="${STATE_DIR}/${P_UUID}.journal"
@@ -1359,9 +1400,10 @@ cmd_run() {
     # shellcheck disable=SC2034  # journal field, only written for diagnosis
     J_STRATEGY="${P_STRATEGY}"
     J_ORIG_STATE="${P_STATE}"; J_START_TYPE="${P_START_TYPE}"; J_KEEP_SOURCE="${KEEP_SOURCE}"
+    J_SRC_ID="$(stat -c '%d:%i' -- "${P_SRC}")"
     : > "${JOURNAL_FILE}"
     for key in J_VM_UUID J_VM_NAME J_SRC_DIR J_DST_DIR J_TMP_DIR J_CFG_NAME J_STRATEGY \
-               J_ORIG_STATE J_START_TYPE J_KEEP_SOURCE; do
+               J_ORIG_STATE J_START_TYPE J_KEEP_SOURCE J_SRC_ID; do
         journal_set "${key}" "${!key}"
     done
     RUN_ACTIVE=1
@@ -1388,11 +1430,14 @@ cmd_run() {
 
     # Copy and verify.
     step copy "Copying ${P_SRC} to ${P_TMP}"
+    mkdir -m 700 -- "${P_TMP}" || die "Could not reserve ${P_TMP}"
+    J_COPY_ID="$(stat -c '%d:%i' -- "${P_TMP}")"; journal_set J_COPY_ID "${J_COPY_ID}"
     J_STEP_COPY_STARTED=1; journal_set J_STEP_COPY_STARTED 1
     copy_folder "${P_SRC}" "${P_TMP}"
     step verify "Verifying the copy (${VERIFY})"
     verify_copy "${P_SRC}" "${P_TMP}" || die "Verification of the copy failed"
-    mv -- "${P_TMP}" "${P_DST}"
+    mv -Tn -- "${P_TMP}" "${P_DST}"
+    same_dir "${P_DST}" "${J_COPY_ID}" || die "Destination changed while copying"
     J_STEP_RENAMED=1; journal_set J_STEP_RENAMED 1
 
     # Re-register at the target.
@@ -1407,6 +1452,7 @@ cmd_run() {
     # Switchover ends: start the VM at the target.
     if [ "${P_STRATEGY}" = "reflink" ]; then
         step start "Starting the VM at the target (${P_START_TYPE})"
+        J_START_INTENT=1; journal_set J_START_INTENT 1
         start_vm "${P_UUID}" "${P_START_TYPE}" "${P_STATE}" || die "Could not start the VM at the target"
         downtime end
     fi
@@ -1432,17 +1478,19 @@ cmd_recover() {
     if ! journal="$(find_journal "${VM_ARG}")"; then
         die "No journal found for '${VM_ARG}' in ${STATE_DIR}"
     fi
+    take_lock "$(basename -- "${journal}" .journal)"
+    [ -f "${journal}" ] || die "Journal has already been processed"
     JOURNAL_FILE="${journal}"
     journal_clear_vars
     # shellcheck source=/dev/null
     . "${JOURNAL_FILE}"
-    take_lock "${J_VM_UUID}"
+    [[ -n "${J_VM_UUID}" && -n "${J_CFG_NAME}" && "${J_SRC_DIR}" = /* && "${J_DST_DIR}" = /* ]] || die "Incomplete journal: ${journal}"
 
     # The VM may already run at the target although the journal does not
     # say so yet (e.g. interrupted while waiting for the start).
     if [ "${J_STEP_DST_STARTED}" != "1" ] && vm_registered "${J_VM_UUID}" && vm_info_try "${J_VM_UUID}" && \
        [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ] && \
-       { [ "$(state_class "$(vmi VMState)")" = "live" ] || [ "$(state_class "${J_ORIG_STATE}")" = "offline" ]; } && \
+       [ "$(state_class "$(vmi VMState)")" = "live" ] && \
        [ "${J_STEP_DST_REGISTERED}" = "1" ]; then
         J_STEP_DST_STARTED=1
     fi
@@ -1482,6 +1530,7 @@ cmd_recover() {
 # =============================================================================
 
 main() {
+    umask 077
     load_config
     apply_env
     parse_args "$@"

@@ -122,3 +122,15 @@ EOF
         "${BATS_TEST_TMPDIR}/a" "${BATS_TEST_TMPDIR}/b"
     [ "${status}" -ne 0 ]
 }
+
+@test "verification fails if both manifest generators fail" {
+    run bash -c '. "$0"; STATE_DIR="$1"; verify_copy "$1/missing-a" "$1/missing-b"' "${SCRIPT}" "${BATS_TEST_TMPDIR}"
+    [ "${status}" -ne 0 ]
+}
+
+@test "cleanup stops when another machine shares the source directory" {
+    mkdir -p "${BATS_TEST_TMPDIR}/vm/child"
+    touch "${BATS_TEST_TMPDIR}/vm/mine.vbox" "${BATS_TEST_TMPDIR}/vm/child/other.vbox"
+    run bash -c '. "$0"; src_is_dedicated "$1/vm" mine.vbox' "${SCRIPT}" "${BATS_TEST_TMPDIR}"
+    [ "${status}" -ne 0 ]
+}
