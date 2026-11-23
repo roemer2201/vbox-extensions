@@ -37,7 +37,7 @@
 #   vbox-relocate recover <vm>
 #   vbox-relocate --help
 #
-# Version: 0.2.0  (2026-11-23)
+# Version: 0.3.0  (2026-11-23)
 #
 # License: GPL-3.0-only (see LICENSE in the repository)
 
@@ -48,7 +48,7 @@ set -euo pipefail
 
 # --- Fixed settings ----------------------------------------------------------
 SCRIPT_NAME="$(basename -- "${0}")"
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.3.0"
 
 # Name of the user configuration file (searched below ${HOME}/.config).
 CONFIG_NAME="vbox-relocate.conf"
@@ -130,9 +130,8 @@ Options:
                        copy is not implemented yet (planned).
                        Env: VBOX_RELOCATE_STRATEGY      Default: auto
       --ram-mode M     auto, require, off. Keep the saved state in RAM
-                       (tmpfs) during the switchover. Not implemented yet
-                       (planned): auto/off write the state to disk,
-                       require refuses to relocate running VMs.
+                       (tmpfs) during the switchover. auto falls back to disk, require
+                       aborts if RAM setup is unavailable, off writes to disk.
                        Env: VBOX_RELOCATE_RAM_MODE      Default: auto
       --ram-reserve MIB
                        Minimum free RAM that must remain in RAM mode.
@@ -727,6 +726,7 @@ journal_clear_vars() {
     J_VM_UUID=""; J_VM_NAME=""; J_SRC_DIR=""; J_DST_DIR=""; J_TMP_DIR=""
     J_CFG_NAME=""; J_STRATEGY=""; J_ORIG_STATE=""; J_START_TYPE=""
     J_KEEP_SOURCE=0; J_STEP_SAVED=0; J_STEP_COPY_STARTED=0; J_STEP_RENAMED=0
+    J_RAM_STAGE=off; J_SNAP=""; J_SAV_NAME=""
     J_SRC_ID=""; J_COPY_ID=""; J_START_INTENT=0
     J_STEP_SRC_UNREGISTERED=0; J_STEP_DST_REGISTERED=0; J_STEP_DST_STARTED=0
 }
@@ -964,23 +964,36 @@ build_plan() {
         fi
     fi
 
-    # RAM mode (estimate only; the RAM mode itself is planned for phase 2)
-    P_RAM_EST=$(( ( ${P_MEMORY:-0} + ${P_VRAM:-0} ) * 105 / 100 ))
+    # Account for the configured reserve and keep at least 10% of host RAM.
+    P_RAM_EST=$(( ((P_MEMORY + P_VRAM) * 105 + 99) / 100 ))
     P_RAM_AVAIL="$(mem_mib MemAvailable)"
-    local total_mib reserve
+    local total_mib reserve reason=""
     total_mib="$(mem_mib MemTotal)"
-    reserve="${RAM_RESERVE}"
-    if [ $((total_mib / 10)) -gt "${reserve}" ]; then
-        reserve=$((total_mib / 10))
-    fi
+    reserve=$((10#${RAM_RESERVE}))
+    if ((total_mib / 10 > reserve)); then reserve=$((total_mib / 10)); fi
     P_RAM_REQ=$((P_RAM_EST + reserve))
     P_RAM_DECISION="not-applicable"
-    if [ "${P_STRATEGY}" = "reflink" ]; then
-        P_RAM_DECISION="disk"
-        if [ "${RAM_MODE}" = "require" ]; then
-            block "RAM mode is not implemented yet (planned); use --ram-mode auto or off"
-        elif [ "${RAM_MODE}" = "auto" ]; then
-            note_warning "RAM mode is not implemented yet; the saved state (about ${P_RAM_EST} MiB) is written to disk"
+    if [ "${P_CLASS}" = live ]; then
+        P_RAM_DECISION=disk
+        if [ "${RAM_MODE}" != off ]; then
+            if ((P_RAM_EST <= 0 || P_RAM_AVAIL < P_RAM_REQ)); then
+                reason="insufficient RAM (${P_RAM_AVAIL} MiB available, ${P_RAM_REQ} MiB required)"
+            elif [ "${UID}" = 0 ] || ! command -v pkexec >/dev/null ||
+                 [ ! -x /usr/libexec/vbox-relocate/vbox-relocate-helper ]; then
+                reason="the polkit helper is unavailable to this VM owner"
+            elif [ "$(realpath -m -- "${P_SNAPFLDR}")" != "${P_SNAPFLDR}" ] ||
+                 [ "${P_SNAPFLDR}" = "${P_SRC}" ]; then
+                reason="RAM mode needs a dedicated canonical snapshot directory"
+            fi
+            if [ -z "${reason}" ]; then
+                P_RAM_DECISION=ram
+                note_warning "Host power loss before resume loses the volatile saved state"
+                if [ "$(mem_mib SwapTotal)" -gt 0 ]; then note_warning "Swap is active; tmpfs pages may be swapped out"; fi
+            elif [ "${RAM_MODE}" = require ]; then
+                block "RAM mode required: ${reason}"
+            else
+                note_warning "Saving state to disk: ${reason}"
+            fi
         fi
     fi
 
@@ -1237,6 +1250,81 @@ start_vm() {
     fi
 }
 
+# A fixed, administrator-installed executable is the only privileged entry point.
+ram_helper() {
+    pkexec /usr/libexec/vbox-relocate/vbox-relocate-helper "$@" >&2
+}
+
+# Record intent before pausing or mounting. Rollback can undo either operation
+# even if the CLI dies before VBoxManage or pkexec returns.
+ram_prepare() {
+    J_RAM_STAGE=prepare; journal_set J_RAM_STAGE prepare
+    J_SNAP="${P_SNAPFLDR}"; journal_set J_SNAP "${J_SNAP}"
+    mkdir -p -- "${J_SNAP}"
+    if [ "${P_STATE}" = running ]; then
+        vbm_action controlvm "${P_UUID}" pause || die "Could not pause the guest before mounting its snapshot overlay"
+    fi
+    if ! ram_helper prepare "${P_UUID}" "${P_RAM_EST}" "${P_SRC}/${P_CFG_NAME}" "${J_SNAP}"; then
+        if [ "${RAM_MODE}" = require ]; then die "Required RAM setup failed"; fi
+        # If setup partially succeeded, confirm teardown before continuing on disk.
+        ram_release || die "RAM setup incomplete; recover before continuing"
+        warn "RAM setup unavailable; saving the guest state to disk"
+    fi
+}
+
+# Preserve the exact file selected by VBoxManage. The privileged helper only
+# accepts an upper directory containing that one file and releases the overlay.
+ram_capture() {
+    local saved_path name link
+    if [ -z "${J_SAV_NAME}" ]; then
+        vm_info_try "${J_VM_UUID}" || return 1
+        saved_path="$(vmi VMStateFile)"
+        [ "$(dirname -- "${saved_path}")" = "${J_SNAP}" ] || { err "Unexpected VMStateFile: ${saved_path}"; return 1; }
+        name="$(basename -- "${saved_path}")"
+        [[ "${name}" = *.sav ]] || return 1
+        J_SAV_NAME="${name}"; journal_set J_SAV_NAME "${name}" || return 1
+    fi
+    ram_helper capture "${J_VM_UUID}" "${J_SAV_NAME}" || return 1
+    link="${J_SNAP}/${J_SAV_NAME}"
+    local backing
+    backing="$(ram_root)/ram/state/${J_SAV_NAME}"
+    [ -f "${backing}" ] || { err "RAM state is missing: ${backing}"; return 1; }
+    if [ -L "${link}" ]; then
+        [ "$(readlink -- "${link}")" = "${backing}" ] || return 1
+    else
+        ln -sT -- "${backing}" "${link}" || return 1
+    fi
+    J_RAM_STAGE=captured; journal_set J_RAM_STAGE captured
+}
+
+# Private runtime path is derived from the invoking UID, never supplied to root.
+ram_root() {
+    printf '/run/vbox-relocate/%s/%s' "${UID}" "${J_VM_UUID}"
+}
+
+# Once the VM has resumed, release volatile state. With --keep-source the
+# saved source must still be restorable after tmpfs disappears.
+ram_release() {
+    local link tmp backing
+    [ "${J_RAM_STAGE}" != off ] || return 0
+    if [ "${J_STEP_DST_STARTED}" = 1 ] && [ "${J_KEEP_SOURCE}" = 1 ] && [ -n "${J_SAV_NAME}" ]; then
+        link="${J_SNAP}/${J_SAV_NAME}"
+        backing="$(ram_root)/ram/state/${J_SAV_NAME}"
+        if [ -L "${link}" ]; then
+            [ "$(readlink -- "${link}")" = "${backing}" ] || return 1
+            tmp="$(mktemp -- "${J_SNAP}/.relocate-state.XXXXXXXX")" || return 1
+            if ! cp --sparse=always -- "${backing}" "${tmp}" || ! mv -Tf -- "${tmp}" "${link}"; then
+                rm -f -- "${tmp}"
+                return 1
+            fi
+        elif [ ! -f "${link}" ]; then
+            err "Retained source saved state is missing"; return 1
+        fi
+    fi
+    if [ -e "$(ram_root)/operation.json" ]; then ram_helper release "${J_VM_UUID}" || return 1; fi
+    J_RAM_STAGE=off; journal_set J_RAM_STAGE off
+}
+
 # Roll back an interrupted relocation using the journal variables (J_*).
 # Errors do not stop the rollback; every step reports its own failure.
 # Returns 0 if the source is fully restored.
@@ -1290,16 +1378,24 @@ rollback() {
         fi
     fi
 
+    # Reconstruct the source link even if savestate completed between journal writes.
+    if [ "${ok}" = 1 ] && [ "${J_RAM_STAGE}" = prepare ] && [ "$(vmi VMState)" = saved ]; then
+        ram_capture || { err "RAM capture incomplete; retaining the VM and mounts"; return 1; }
+    fi
+
     # 4. Restart a VM that was running before.
     if [ "${ok}" -eq 1 ] && [ "$(state_class "${J_ORIG_STATE}")" = "live" ]; then
         if [ "$(vmi VMState)" = "saved" ]; then
             start_vm "${J_VM_UUID}" "${J_START_TYPE}" "${J_ORIG_STATE}" || { err "Could not restart the VM at the source"; ok=0; }
+        elif [ "$(vmi VMState)" = paused ] && [ "${J_ORIG_STATE}" = running ]; then
+            vbm_action controlvm "${J_VM_UUID}" resume || ok=0
         elif [ "$(state_class "$(vmi VMState)")" != live ]; then
             err "Unexpected source state: $(vmi VMState)"
             ok=0
         fi
     fi
 
+    if [ "${ok}" = 1 ]; then ram_release || ok=0; fi
     set -e
     if [ "${ok}" -eq 1 ]; then
         rm -f -- "${JOURNAL_FILE}"
@@ -1436,11 +1532,10 @@ cmd_run() {
     if [ "${P_STRATEGY}" = "reflink" ]; then
         step savestate "Saving the VM state (switchover begins)"
         downtime begin
+        if [ "${P_RAM_DECISION}" = ram ]; then ram_prepare; fi
         if ! vbm_action controlvm "${P_UUID}" savestate; then
             # If the VM still runs, nothing has changed yet.
             if vm_info_try "${P_UUID}" && [ "$(state_class "$(vmi VMState)")" = "live" ]; then
-                RUN_ACTIVE=0
-                rm -f -- "${JOURNAL_FILE}"
                 downtime end
                 die "Saving the VM state failed; the VM keeps running at the source"
             fi
@@ -1448,6 +1543,7 @@ cmd_run() {
         fi
         # shellcheck disable=SC2034  # journal field, read back by "recover"
         J_STEP_SAVED=1; journal_set J_STEP_SAVED 1
+        if [ "${J_RAM_STAGE}" = prepare ]; then ram_capture || die "Could not capture saved RAM"; fi
         expected_state="saved"
     fi
 
@@ -1484,6 +1580,7 @@ cmd_run() {
     # Clean up the source. A failure here does not roll back.
     step cleanup "Cleaning up the source folder"
     RUN_ACTIVE=0
+    ram_release || die "Could not release saved RAM; finish with recover"
     if ! cleanup_source "${P_SRC}" "${P_DST}" "${P_CFG_NAME}" "${P_UUID}" "${KEEP_SOURCE}"; then
         err "Relocation succeeded, but the source could not be cleaned up; finish with: ${SCRIPT_NAME} recover ${P_UUID}"
         result failed
@@ -1521,6 +1618,7 @@ cmd_recover() {
     if [ "${J_STEP_DST_STARTED}" = "1" ]; then
         info "VM '${J_VM_NAME}' is at ${J_DST_DIR}; finishing the cleanup"
         step cleanup "Cleaning up the source folder"
+        ram_release || die "Could not release saved RAM; journal kept"
         cleanup_source "${J_SRC_DIR}" "${J_DST_DIR}" "${J_CFG_NAME}" "${J_VM_UUID}" "${J_KEEP_SOURCE}" \
             || die "Cleanup failed; journal kept: ${JOURNAL_FILE}"
         rm -f -- "${JOURNAL_FILE}"

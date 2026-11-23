@@ -1,0 +1,230 @@
+#!/usr/bin/python3 -I
+"""Manage the private tmpfs and short-lived snapshot overlay for vbox-relocate.
+
+Validate the registered machine settings as the invoking user, pin the mount
+target, and keep privileged metadata under /run. Never run caller-supplied
+programs or recursively delete caller-owned files. Version 0.3.0 (2026-11-23).
+"""
+import argparse
+import contextlib
+import ctypes
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+import xml.etree.ElementTree as ET
+
+ROOT = Path("/run/vbox-relocate")
+LIBC = ctypes.CDLL(None, use_errno=True)
+SAFE_FLAGS = 2 | 4 | 8  # MS_NOSUID | MS_NODEV | MS_NOEXEC
+NOFOLLOW = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
+
+
+def syscall(status):
+    if status == -1:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+def mount(kind, label, target, options):
+    syscall(LIBC.mount(os.fsencode(label), os.fsencode(target), kind.encode(),
+                       ctypes.c_ulong(SAFE_FLAGS), os.fsencode(options)))
+
+
+def unmount(target):
+    # Pin the parent FD and reject a symlink at the last component.
+    syscall(LIBC.umount2(os.fsencode(target), 8))  # UMOUNT_NOFOLLOW
+
+
+@contextlib.contextmanager
+def caller(uid):
+    """Perform all discovery of user-controlled paths with the caller's DAC."""
+    groups = os.getgroups()
+    gid = pwd.getpwuid(uid).pw_gid
+    os.initgroups(pwd.getpwuid(uid).pw_name, gid)
+    os.setegid(gid)
+    os.seteuid(uid)
+    try:
+        yield
+    finally:
+        os.seteuid(0)
+        os.setegid(0)
+        os.setgroups(groups)
+
+
+def mount_info(fd):
+    """Return mount ID, filesystem and source for a pinned directory."""
+    with open(f"/proc/self/fdinfo/{fd}") as src:
+        ident = next(line.split()[1] for line in src if line.startswith("mnt_id:"))
+    with open("/proc/self/mountinfo") as src:
+        for line in src:
+            if line.split(" ", 1)[0] == ident:
+                kind, source, _ = line.split(" - ", 1)[1].split(" ", 2)
+                return ident, kind, source
+    raise ValueError("Cannot identify mount in this namespace")
+
+
+def record(path, data):
+    tmp = path.with_suffix(".new")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def snapshot_dir(uid, uuid, cfg, snap):
+    with caller(uid):
+        cfg, snap = Path(cfg), Path(snap)
+        if not cfg.is_absolute() or cfg.resolve(strict=True) != cfg or cfg.suffix != ".vbox":
+            raise ValueError("Expected canonical .vbox settings")
+        with cfg.open("rb") as src:
+            if os.fstat(src.fileno()).st_uid != uid:
+                raise ValueError("Settings must belong to caller")
+            machine = ET.parse(src).getroot().find("{*}Machine")
+        if machine is None or machine.get("uuid", "").strip("{}").lower() != uuid:
+            raise ValueError("Settings UUID mismatch")
+        expected = cfg.parent / (machine.get("snapshotFolder") or "Snapshots")
+        if snap != expected.resolve(strict=True) or not snap.is_relative_to(cfg.parent) or snap == cfg.parent:
+            raise ValueError("Expected a dedicated snapshot directory inside the VM")
+        parent = os.open(snap.parent, NOFOLLOW)
+        lower = os.open(snap.name, NOFOLLOW, dir_fd=parent)
+        if os.fstat(lower).st_uid != uid or os.fstat(parent).st_uid != uid:
+            raise ValueError("Snapshot directory and parent must belong to caller")
+        if mount_info(parent)[0] != mount_info(lower)[0]:
+            raise ValueError("Snapshot directory already has a mount")
+    return parent, lower, snap
+
+
+def prepare(uid, args, root, ram, meta, label):
+    if meta.exists() or os.path.ismount(ram):
+        raise ValueError("RAM operation already exists; recover it first")
+    if args.mib <= 0 or args.mib > 2**31:
+        raise ValueError("Invalid tmpfs size")
+    parent, lower, snap = snapshot_dir(uid, args.uuid, args.cfg, args.snap)
+    ram.mkdir(mode=0o700, exist_ok=True)
+    data = {"snap": str(snap), "parent": os.fstat(parent).st_ino,
+            "device": os.fstat(parent).st_dev, "lower": os.fstat(lower).st_ino}
+    record(meta, data)  # Intent precedes both mounts.
+    mount("tmpfs", label, ram, f"size={args.mib}M,mode=0711")
+    (ram / "private").mkdir(mode=0o700)
+    (ram / "state").mkdir(mode=0o711)
+    upper, work = ram / "private/upper", ram / "private/work"
+    upper.mkdir()
+    work.mkdir()
+    st = os.fstat(lower)
+    os.chown(upper, uid, st.st_gid)
+    os.chmod(upper, stat.S_IMODE(st.st_mode) & 0o777)
+    pinned = f"/proc/self/fd/{lower}"
+    mount("overlay", label, pinned,
+          f"lowerdir={pinned},upperdir={upper},workdir={work},userxattr,index=off")
+
+
+def release_overlay(uid, data, ram, label, sav):
+    """Detach only our own overlay. Unknown upper entries need inspection."""
+    snap = Path(data["snap"])
+    with caller(uid):
+        parent = os.open(snap.parent, NOFOLLOW)
+        pstat = os.fstat(parent)
+        if (pstat.st_dev, pstat.st_ino) != (data["device"], data["parent"]):
+            raise ValueError("Snapshot parent changed")
+        fd = os.open(snap.name, NOFOLLOW, dir_fd=parent)
+    try:
+        ident, kind, source = mount_info(fd)
+        our_overlay = (kind, source) == ("overlay", label)
+        if not our_overlay and (os.fstat(fd).st_ino != data["lower"] or
+                                ident != mount_info(parent)[0]):
+            raise ValueError("Unexpected mount or directory at snapshot path")
+        upper = ram / "private/upper"
+        entries = [p.name for p in upper.iterdir()] if upper.exists() else []
+        if entries and entries != [sav]:
+            raise ValueError("Unexpected overlay changes; retaining RAM mount and journal")
+        if sav:
+            stored = ram / "state" / sav
+            source_file = upper / sav
+            if entries:
+                st = source_file.lstat()
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+                    raise ValueError("Invalid saved state in overlay")
+            elif not stored.is_file():
+                raise ValueError("Saved state missing from RAM")
+        os.close(fd)
+        fd = -1
+        if our_overlay:
+            unmount(f"/proc/self/fd/{parent}/{snap.name}")
+        if sav and entries:
+            # Only move the upper file once the overlay is unmounted.
+            source_file.rename(stored)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent)
+
+
+def operate(uid, args):
+    root = ROOT / str(uid) / args.uuid
+    ram, meta = root / "ram", root / "operation.json"
+    label = f"vbox-relocate-{uid}-{args.uuid}"
+    # Only root can name a child in this hierarchy. The caller can traverse
+    # it to read the one saved-state file after capture.
+    for part in (ROOT, root.parent, root):
+        part.mkdir(mode=0o711, exist_ok=True)
+    with (root / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command == "prepare":
+            prepare(uid, args, root, ram, meta, label)
+            return
+        if not meta.exists():
+            if args.command == "release":
+                return
+            raise ValueError("No RAM operation found")
+        data = json.loads(meta.read_text())
+        if os.path.ismount(ram):
+            fd = os.open(ram, NOFOLLOW)
+            try:
+                if mount_info(fd)[1:] != ("tmpfs", label):
+                    raise ValueError("Unexpected filesystem at RAM path")
+            finally:
+                os.close(fd)
+            sav = getattr(args, "sav", None)
+            if sav and (Path(sav).name != sav or not sav.endswith(".sav")):
+                raise ValueError("Expected a saved-state basename")
+            release_overlay(uid, data, ram, label, sav)
+            if args.command == "capture":
+                return
+            unmount(ram)
+        elif args.command == "capture":
+            raise ValueError("RAM mount is missing")
+        if ram.exists():
+            ram.rmdir()
+        meta.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    setup = sub.add_parser("prepare", help="mount tmpfs and overlay before savestate")
+    setup.add_argument("uuid")
+    setup.add_argument("mib", type=int)
+    setup.add_argument("cfg")
+    setup.add_argument("snap")
+    capture = sub.add_parser("capture", help="detach overlay and retain the saved state")
+    capture.add_argument("uuid")
+    capture.add_argument("sav")
+    sub.add_parser("release", help="detach an empty overlay and release tmpfs").add_argument("uuid")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.uuid):
+        parser.error("invalid VM UUID")
+    uid = int(os.environ.get("PKEXEC_UID", "-1"))
+    if uid <= 0 or os.getuid() != 0 or os.geteuid() != 0:
+        parser.error("invoke through pkexec as the VM owner")
+    os.umask(0o022)
+    operate(uid, args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, ET.ParseError) as error:
+        sys.exit(f"vbox-relocate-helper: {error}")
