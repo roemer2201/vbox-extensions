@@ -1,0 +1,1905 @@
+#!/usr/bin/env bash
+#
+# vbox-relocate
+#
+# Description:
+#   Relocates the complete folder of an Oracle VirtualBox VM (settings,
+#   disk images, snapshots, saved state, NVRAM, logs) to another directory
+#   on the same host.
+#   - VMs that are not running are copied and re-registered (strategy
+#     "offline").
+#   - Running VMs use a reflink clone or a live snapshot and rsync pre-copy.
+#     The final saved state can be captured in tmpfs via the polkit helper.
+#
+# Program flow (subcommand "run"):
+#   1. Resolve settings, lock the VM, check paths, media, space and state.
+#   2. Confirm the plan and obtain RAM authorization before interrupting a guest.
+#   3. Publish the journal and reserve staging. For copy, take a live
+#      snapshot and pre-copy its frozen disk chain and snapshot states.
+#   4. Save a live guest, optionally through a temporary snapshot overlay.
+#   5. Finish and verify the copy, switch registration and validate media.
+#   6. Resume the guest, release RAM, merge the temporary snapshot and
+#      clean up the source. Log progress to syslog and interactive terminals.
+#   Before switchover a failure restores the source. After the target has
+#   resumed it is authoritative; recover retries outstanding cleanup there.
+#
+# Usage:
+#   vbox-relocate list
+#   vbox-relocate plan <vm> --target DIR
+#   vbox-relocate run <vm> --target DIR [--yes]
+#   vbox-relocate recover <vm>
+#   vbox-relocate --help
+#
+# Version: 0.4.0  (2026-11-23)
+#
+# License: GPL-3.0-only (see LICENSE in the repository)
+
+# Robustness baseline: exit on uncaught errors, unset variables are errors,
+# pipelines fail if any stage fails. Places that tolerate failures on purpose
+# disable this locally and say why.
+set -euo pipefail
+
+# --- Fixed settings ----------------------------------------------------------
+SCRIPT_NAME="$(basename -- "${0}")"
+SCRIPT_VERSION="0.4.0"
+
+# Name of the user configuration file (searched below ${HOME}/.config).
+CONFIG_NAME="vbox-relocate.conf"
+
+# Suffix of the temporary target folder while copying, and of a kept source.
+TMP_SUFFIX=".relocate-tmp"
+KEEP_SUFFIX=".relocated"
+
+# Free space that must remain on the target in addition to the copied data.
+SPACE_RESERVE_BYTES=$((256 * 1024 * 1024))
+
+# Seconds to wait for the VM to reach "running" after startvm.
+START_TIMEOUT=180
+
+# logger failures must never interrupt a VM switchover.
+SYSLOG_FAILED=0
+
+# --- Built-in defaults (lowest precedence) -----------------------------------
+TARGET=""
+STRATEGY="auto"
+RAM_MODE="auto"
+RAM_RESERVE=1024
+VERIFY="size"
+KEEP_SOURCE=0
+START_TYPE="auto"
+ASSUME_YES=0
+MACHINE_READABLE=0
+VBOXMANAGE="VBoxManage"
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/vbox-relocate"
+
+# Output switches are read from the environment early, so that loading the
+# configuration already respects them. They are applied again in apply_env().
+VERBOSE="${VBOX_RELOCATE_VERBOSE:-0}"
+SILENT="${VBOX_RELOCATE_SILENT:-0}"
+
+# --- Runtime state -----------------------------------------------------------
+SUBCOMMAND=""
+VM_ARG=""
+RESULT_EMITTED=0
+RUN_ACTIVE=0
+JOURNAL_FILE=""
+LOCK_FD=""
+declare -A VMI=() EXPECTED_MEDIA=()
+declare -a MED_UUID=() MED_PARENT=() MED_STATE=() MED_TYPE=() MED_LOC=() MED_KIND=()
+declare -a BLOCKERS=() WARNINGS=()
+
+# =============================================================================
+# Help
+# =============================================================================
+
+# Print usage information.
+usage() {
+    cat <<'EOF'
+Usage: vbox-relocate SUBCOMMAND [VM] [OPTIONS]
+
+Relocates the complete folder of a VirtualBox VM to another directory on the
+same host. For running VMs the switchover saves and restores the guest.
+Without reflinks, a live snapshot allows frozen disks to be copied ahead.
+
+Subcommands:
+  list                 List VMs with state, folder, size and snapshot count.
+  plan VM -t DIR       Run all checks and show what "run" would do. Changes
+                       nothing.
+  run VM -t DIR        Relocate the VM folder into DIR.
+  recover VM           Finish or roll back an interrupted run (uses the
+                       journal of that VM).
+
+Arguments:
+  VM                   Name or UUID of the VM.
+                       Env: VBOX_RELOCATE_VM
+
+Options:
+  -t, --target DIR     Target parent directory. The VM folder keeps its name:
+                       the result is DIR/<name of the source folder>.
+                       Env: VBOX_RELOCATE_TARGET        Default: (none)
+      --strategy S     auto, offline, reflink, copy.
+                       auto: offline for VMs that are not running, reflink
+                       when cloning works, otherwise copy via a live snapshot.
+                       Env: VBOX_RELOCATE_STRATEGY      Default: auto
+      --ram-mode M     auto, require, off. Keep the saved state in RAM
+                       (tmpfs) during the switchover. auto falls back to disk, require
+                       aborts if RAM setup is unavailable, off writes to disk.
+                       Env: VBOX_RELOCATE_RAM_MODE      Default: auto
+      --ram-reserve MIB
+                       Minimum free RAM that must remain in RAM mode.
+                       Env: VBOX_RELOCATE_RAM_RESERVE   Default: 1024
+      --verify L       size: compare file list and sizes.
+                       checksum: additionally compare SHA-256 of all files.
+                       Env: VBOX_RELOCATE_VERIFY        Default: size
+      --keep-source    Rename the source folder to
+                       <folder>.relocated-<timestamp> instead of deleting it.
+                       Env: VBOX_RELOCATE_KEEP_SOURCE   Default: 0
+      --start-type T   auto, gui, headless, separate. How to start a running
+                       VM at the target. auto: as it was started before.
+                       Env: VBOX_RELOCATE_START_TYPE    Default: auto
+  -y, --yes            Do not ask for confirmation.
+                       Env: VBOX_RELOCATE_YES           Default: 0
+      --machine-readable
+                       Line protocol on STDOUT for front ends (see below).
+                       Env: VBOX_RELOCATE_MACHINE_READABLE  Default: 0
+  -s, --silent         Only print errors. Mutually exclusive with --verbose.
+                       Env: VBOX_RELOCATE_SILENT        Default: 0
+  -v, --verbose        Print additional diagnostic messages.
+                       Env: VBOX_RELOCATE_VERBOSE       Default: 0
+      --version        Print the version and exit.
+  -h, --help           Show this help and exit.
+
+Additional environment variables:
+  VBOX_RELOCATE_VBOXMANAGE   VBoxManage binary.  Default: VBoxManage
+  VBOX_RELOCATE_STATE_DIR    Directory for journals and locks.
+                             Default: ${XDG_STATE_HOME:-~/.local/state}/vbox-relocate
+
+Boolean values accept 1/0, yes/no, true/false, on/off.
+
+Configuration file (optional, sourced as shell code), first match wins:
+  ~/.config/<ORGANIZATION>/vbox-relocate.conf   (ORGANIZATION from /etc/org.conf)
+  ~/.config/orgdefault/vbox-relocate.conf
+  ~/.config/vbox-relocate.conf
+Keys: TARGET, STRATEGY, RAM_MODE, RAM_RESERVE, VERIFY, KEEP_SOURCE,
+START_TYPE, VBOXMANAGE, STATE_DIR, VERBOSE, SILENT.
+
+Precedence for every setting: command-line argument > environment variable
+> configuration file > built-in default.
+
+Machine-readable protocol (STDOUT, one record per line; errors stay on STDERR):
+  PLAN key="value"         plan details
+  VM key="value" ...       one line per VM (list)
+  STEP <id> <text>         a step begins
+  PROGRESS <0-100> <id>    progress of the current step
+  DOWNTIME begin|end       switchover of a running VM
+  INFO <text> / DEBUG <text> / WARN <text>
+  RESULT ok|failed|rolled-back   always the last line
+
+Exit status: 0 success, 1 failure (including rollback), 2 usage error.
+
+Examples:
+  vbox-relocate plan "Ubuntu 24.04" -t /srv/vms
+  vbox-relocate run "Ubuntu 24.04" -t /srv/vms --keep-source
+EOF
+}
+
+# =============================================================================
+# Output helpers
+# =============================================================================
+
+# Quote a value for machine-readable records: wrap in double quotes and
+# escape backslashes and double quotes.
+mr_quote() {
+    local v="${1}"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "${v}"
+}
+
+# Keep operational records separate from list/plan data and the GUI protocol.
+# Fall back to stderr if the local syslog socket is unavailable.
+syslog_event() {
+    local priority="${1}" message="${2}"
+    if [ "${SYSLOG_FAILED}" = 0 ]; then
+        if logger --socket-errors=on -t vbox-relocate -p "user.${priority}" -- "${VM_ARG:+[${VM_ARG}] }${message}" 2>/dev/null; then
+            return 0
+        fi
+        SYSLOG_FAILED=1
+        printf '%s\n' "vbox-relocate: syslog unavailable; using stderr" >&2
+    fi
+    if [ ! -t 2 ] && [ "${priority}" != err ] && [ "${SILENT}" != 1 ]; then printf '%s\n' "${message}" >&2; fi
+}
+
+# Normal status message. Machine-readable mode: "INFO" record.
+info() {
+    syslog_event info "$*"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'INFO %s\n' "$*"
+    elif [ "${SILENT}" -ne 1 ] && [ -t 1 ]; then
+        printf '%s\n' "$*"
+    fi
+}
+
+# Diagnostic message, only with --verbose.
+verbose() {
+    if [ "${VERBOSE}" -ne 1 ]; then
+        return 0
+    fi
+    syslog_event debug "$*"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'DEBUG %s\n' "$*"
+    elif [ -t 1 ]; then
+        printf 'debug: %s\n' "$*"
+    fi
+}
+
+# Warning. Machine-readable mode: "WARN" record on STDOUT, otherwise STDERR.
+warn() {
+    syslog_event warning "$*"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'WARN %s\n' "$*"
+    elif [ "${SILENT}" -ne 1 ] && [ -t 2 ]; then
+        printf '%s: warning: %s\n' "${SCRIPT_NAME}" "$*" >&2
+    fi
+}
+
+# Error message, always on STDERR.
+err() {
+    syslog_event err "$*"
+    printf '%s: error: %s\n' "${SCRIPT_NAME}" "$*" >&2
+}
+
+# Report an anticipated failure and exit non-zero. A running relocation is
+# rolled back by the EXIT trap.
+die() {
+    err "$*"
+    exit 1
+}
+
+# Report a usage error and exit with status 2.
+usage_error() {
+    err "$*"
+    printf "Try '%s --help' for more information.\n" "${SCRIPT_NAME}" >&2
+    exit 2
+}
+
+# Announce a step (id from the protocol, human readable text).
+step() {
+    local id="${1}"
+    shift
+    syslog_event notice "${id}: $*"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'STEP %s %s\n' "${id}" "$*"
+    elif [ "${SILENT}" -ne 1 ] && [ -t 1 ]; then
+        printf '==> %s\n' "$*"
+    fi
+}
+
+# Report progress of a step (machine-readable mode only).
+progress() {
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'PROGRESS %s %s\n' "${1}" "${2}"
+    fi
+}
+
+# Mark begin/end of the switchover (machine-readable mode only).
+downtime() {
+    syslog_event notice "Downtime ${1}"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'DOWNTIME %s\n' "${1}"
+    fi
+}
+
+# Emit the final result record exactly once.
+result() {
+    if [ "${RESULT_EMITTED}" -eq 1 ]; then
+        return 0
+    fi
+    RESULT_EMITTED=1
+    syslog_event notice "Result: ${1}"
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'RESULT %s\n' "${1}"
+    fi
+}
+
+# Format a byte count for humans (e.g. 1.5G).
+human_bytes() {
+    numfmt --to=iec-i --suffix=B --format='%.1f' -- "${1}"
+}
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Normalize a boolean value to 1 or 0. Exits with a usage error otherwise.
+normalize_bool() {
+    local name="${1}" value="${2}"
+    case "${value,,}" in
+        1|yes|true|on)   printf '1' ;;
+        0|no|false|off|"") printf '0' ;;
+        *) usage_error "Invalid boolean value for ${name}: '${value}'" ;;
+    esac
+}
+
+# Source the first existing user configuration file. Only the user scope
+# (${HOME}/.config) is searched, as requested for this tool; the search order
+# within that scope follows the organisation-based convention.
+load_config() {
+    local organization="" f
+    local files=()
+
+    # ORGANIZATION is read from /etc/org.conf in a subshell, so the file
+    # cannot change other variables of this script.
+    if [ -r /etc/org.conf ]; then
+        # shellcheck source=/dev/null
+        organization="$( set +e; . /etc/org.conf >/dev/null 2>&1; printf '%s' "${ORGANIZATION:-}" )"
+    fi
+    if [ -n "${organization}" ]; then
+        files+=("${HOME}/.config/${organization}/${CONFIG_NAME}")
+    fi
+    files+=("${HOME}/.config/orgdefault/${CONFIG_NAME}" "${HOME}/.config/${CONFIG_NAME}")
+
+    for f in "${files[@]}"; do
+        if [ -r "${f}" ]; then
+                # shellcheck source=/dev/null
+            . "${f}"
+            break
+        fi
+    done
+}
+
+# Apply environment variables (they override the configuration file).
+apply_env() {
+    TARGET="${VBOX_RELOCATE_TARGET:-${TARGET}}"
+    STRATEGY="${VBOX_RELOCATE_STRATEGY:-${STRATEGY}}"
+    RAM_MODE="${VBOX_RELOCATE_RAM_MODE:-${RAM_MODE}}"
+    RAM_RESERVE="${VBOX_RELOCATE_RAM_RESERVE:-${RAM_RESERVE}}"
+    VERIFY="${VBOX_RELOCATE_VERIFY:-${VERIFY}}"
+    KEEP_SOURCE="${VBOX_RELOCATE_KEEP_SOURCE:-${KEEP_SOURCE}}"
+    START_TYPE="${VBOX_RELOCATE_START_TYPE:-${START_TYPE}}"
+    ASSUME_YES="${VBOX_RELOCATE_YES:-${ASSUME_YES}}"
+    MACHINE_READABLE="${VBOX_RELOCATE_MACHINE_READABLE:-${MACHINE_READABLE}}"
+    VERBOSE="${VBOX_RELOCATE_VERBOSE:-${VERBOSE}}"
+    SILENT="${VBOX_RELOCATE_SILENT:-${SILENT}}"
+    VBOXMANAGE="${VBOX_RELOCATE_VBOXMANAGE:-${VBOXMANAGE}}"
+    STATE_DIR="${VBOX_RELOCATE_STATE_DIR:-${STATE_DIR}}"
+    VM_ARG="${VBOX_RELOCATE_VM:-${VM_ARG}}"
+}
+
+# Fetch the value of an option that requires an argument.
+# Usage: need_arg OPTION "$@"   (prints the value)
+need_arg() {
+    if [ "$#" -lt 2 ] || [ -z "${2}" ]; then
+        usage_error "Option ${1} requires an argument"
+    fi
+    printf '%s' "${2}"
+}
+
+# Parse the command line (highest precedence). The first positional argument
+# is the subcommand, the second one the VM.
+parse_args() {
+    local positionals=()
+    while [ "$#" -gt 0 ]; do
+        case "${1}" in
+            -t|--target)       TARGET="$(need_arg "$@")"; shift 2 ;;
+            --target=*)        TARGET="${1#*=}"; shift ;;
+            --strategy)        STRATEGY="$(need_arg "$@")"; shift 2 ;;
+            --strategy=*)      STRATEGY="${1#*=}"; shift ;;
+            --ram-mode)        RAM_MODE="$(need_arg "$@")"; shift 2 ;;
+            --ram-mode=*)      RAM_MODE="${1#*=}"; shift ;;
+            --ram-reserve)     RAM_RESERVE="$(need_arg "$@")"; shift 2 ;;
+            --ram-reserve=*)   RAM_RESERVE="${1#*=}"; shift ;;
+            --verify)          VERIFY="$(need_arg "$@")"; shift 2 ;;
+            --verify=*)        VERIFY="${1#*=}"; shift ;;
+            --keep-source)     KEEP_SOURCE=1; shift ;;
+            --start-type)      START_TYPE="$(need_arg "$@")"; shift 2 ;;
+            --start-type=*)    START_TYPE="${1#*=}"; shift ;;
+            -y|--yes)          ASSUME_YES=1; shift ;;
+            --machine-readable) MACHINE_READABLE=1; shift ;;
+            -s|--silent)       SILENT=1; shift ;;
+            -v|--verbose)      VERBOSE=1; shift ;;
+            --version)         printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"; exit 0 ;;
+            -h|--help)         usage; exit 0 ;;
+            --)                shift; positionals+=("$@"); break ;;
+            -*)                usage_error "Unknown option: ${1}" ;;
+            *)                 positionals+=("${1}"); shift ;;
+        esac
+    done
+
+    if [ "${#positionals[@]}" -ge 1 ]; then
+        SUBCOMMAND="${positionals[0]}"
+    fi
+    if [ "${#positionals[@]}" -ge 2 ]; then
+        VM_ARG="${positionals[1]}"
+    fi
+    if [ "${#positionals[@]}" -gt 2 ]; then
+        usage_error "Too many arguments: ${positionals[*]:2}"
+    fi
+}
+
+# Validate and normalize all settings after parsing.
+validate_settings() {
+    KEEP_SOURCE="$(normalize_bool KEEP_SOURCE "${KEEP_SOURCE}")"
+    ASSUME_YES="$(normalize_bool YES "${ASSUME_YES}")"
+    MACHINE_READABLE="$(normalize_bool MACHINE_READABLE "${MACHINE_READABLE}")"
+    VERBOSE="$(normalize_bool VERBOSE "${VERBOSE}")"
+    SILENT="$(normalize_bool SILENT "${SILENT}")"
+
+    if [ "${SILENT}" -eq 1 ] && [ "${VERBOSE}" -eq 1 ]; then
+        usage_error "--silent and --verbose are mutually exclusive"
+    fi
+    case "${STRATEGY}" in
+        auto|offline|reflink|copy) ;;
+        *) usage_error "Invalid strategy: '${STRATEGY}' (auto, offline, reflink, copy)" ;;
+    esac
+    case "${RAM_MODE}" in
+        auto|require|off) ;;
+        *) usage_error "Invalid RAM mode: '${RAM_MODE}' (auto, require, off)" ;;
+    esac
+    case "${VERIFY}" in
+        size|checksum) ;;
+        *) usage_error "Invalid verify level: '${VERIFY}' (size, checksum)" ;;
+    esac
+    case "${START_TYPE}" in
+        auto|gui|headless|separate) ;;
+        *) usage_error "Invalid start type: '${START_TYPE}' (auto, gui, headless, separate)" ;;
+    esac
+    case "${RAM_RESERVE}" in
+        ''|*[!0-9]*) usage_error "Invalid RAM reserve (MiB): '${RAM_RESERVE}'" ;;
+    esac
+
+    case "${SUBCOMMAND}" in
+        list) ;;
+        plan|run)
+            [ -n "${VM_ARG}" ] || usage_error "Subcommand '${SUBCOMMAND}' needs a VM name or UUID"
+            [ -n "${TARGET}" ] || usage_error "Subcommand '${SUBCOMMAND}' needs --target DIR"
+            ;;
+        recover)
+            [ -n "${VM_ARG}" ] || usage_error "Subcommand 'recover' needs a VM name or UUID"
+            ;;
+        "") usage_error "No subcommand given" ;;
+        *)  usage_error "Unknown subcommand: '${SUBCOMMAND}'" ;;
+    esac
+}
+
+# =============================================================================
+# VirtualBox queries
+# =============================================================================
+
+# Parse "VBoxManage showvminfo --machinereadable" output into VMI.
+# Returns non-zero (without message) if the VM cannot be queried.
+vm_info_try() {
+    local vm="${1}" out line key value
+    VMI=()
+    out="$("${VBOXMANAGE}" showvminfo "${vm}" --machinereadable)" || return 1
+    while IFS= read -r line; do
+        # Lines without "=" (e.g. section markers) carry no value.
+        case "${line}" in
+            *=*) ;;
+            *) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#\"}"
+        key="${key%\"}"
+        value="${value#\"}"
+        value="${value%\"}"
+        VMI["${key}"]="${value}"
+    done <<< "${out}"
+}
+
+# Like vm_info_try, but a failure is fatal.
+load_vm_info() {
+    if ! vm_info_try "${1}"; then
+        die "Cannot read information for VM '${1}' (see the VBoxManage message above)"
+    fi
+}
+
+# Return 0 if a VM with this UUID is registered. The query is expected to
+# fail for unregistered VMs, so its error message is suppressed here.
+vm_registered() {
+    "${VBOXMANAGE}" showvminfo "${1}" --machinereadable >/dev/null 2>&1
+}
+
+# Read one value from VMI with an empty default.
+vmi() {
+    printf '%s' "${VMI[${1}]:-}"
+}
+
+# Run a changing VBoxManage command (savestate, startvm, registervm, ...).
+# Its normal output is sent to STDERR, so that it stays visible but cannot
+# disturb the machine-readable protocol on STDOUT.
+vbm_action() {
+    verbose "VBoxManage ${*}"
+    "${VBOXMANAGE}" "$@" >&2
+}
+
+# Load all registered media (hard disks, DVD and floppy images) into the
+# MED_* arrays from "VBoxManage list hdds|dvds|floppies".
+load_media() {
+    local kind out line key value
+    local uuid="" parent="" state="" type="" loc=""
+    MED_UUID=(); MED_PARENT=(); MED_STATE=(); MED_TYPE=(); MED_LOC=(); MED_KIND=()
+
+    # Append the record collected so far.
+    flush_medium() {
+        if [ -n "${uuid}" ]; then
+            MED_UUID+=("${uuid}")
+            MED_PARENT+=("${parent}")
+            MED_STATE+=("${state}")
+            MED_TYPE+=("${type}")
+            MED_LOC+=("${loc}")
+            MED_KIND+=("${kind}")
+        fi
+        uuid=""; parent=""; state=""; type=""; loc=""
+    }
+
+    for kind in hdds dvds floppies; do
+        out="$("${VBOXMANAGE}" list "${kind}")" || die "Cannot list media ('VBoxManage list ${kind}' failed)"
+        while IFS= read -r line; do
+            if [ -z "${line}" ]; then
+                flush_medium
+                continue
+            fi
+            key="${line%%:*}"
+            value="${line#*:}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            case "${key}" in
+                UUID)          flush_medium; uuid="${value}" ;;
+                "Parent UUID") parent="${value}" ;;
+                State)         state="${value}" ;;
+                Type)          type="${value}" ;;
+                Location)      loc="${value}" ;;
+            esac
+        done <<< "${out}"
+        flush_medium
+    done
+}
+
+# Print "major.minor" of the installed VirtualBox.
+vbox_version() {
+    local v
+    v="$("${VBOXMANAGE}" --version)" || die "Cannot run '${VBOXMANAGE} --version'"
+    v="${v%%[!0-9.]*}"
+    printf '%s' "${v%.*}"
+}
+
+# Classify a machine state: offline (not running), live (running or paused)
+# or transient (anything in between). State names: VBoxManageInfo.cpp.
+state_class() {
+    case "${1}" in
+        poweroff|aborted|saved|aborted-saved|teleported) printf 'offline' ;;
+        running|paused) printf 'live' ;;
+        *) printf 'transient' ;;
+    esac
+}
+
+# Wait until the VM reaches running or paused, or fails to start.
+wait_for_running() {
+    local uuid="${1}" waited=0 state
+    while [ "${waited}" -lt "${START_TIMEOUT}" ]; do
+        vm_info_try "${uuid}" || return 1
+        state="$(vmi VMState)"
+        case "${state}" in
+            running|paused) return 0 ;;
+            starting|restoring) ;;
+            *) err "VM did not start, state is '${state}'"; return 1 ;;
+        esac
+        sleep 1
+        waited=$((waited + 1))
+    done
+    err "VM did not reach state 'running' within ${START_TIMEOUT} seconds"
+    return 1
+}
+
+# =============================================================================
+# File system helpers
+# =============================================================================
+
+# Return 0 if path $1 is located below directory $2.
+is_below() {
+    case "${1}" in
+        "${2}"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Identify the file system of a path. The file system UUID is used because
+# btrfs subvolumes have their own device numbers; st_dev is only a fallback
+# for file systems without UUID.
+fs_id() {
+    local id
+    id="$(findmnt -n -o UUID --target "${1}")" || id=""
+    if [ -z "${id}" ]; then
+        id="dev:$(stat -c %d -- "${1}")"
+    fi
+    printf '%s' "${id}"
+}
+
+# File system type of a path (e.g. btrfs).
+fs_type() {
+    findmnt -n -o FSTYPE --target "${1}"
+}
+
+# Return 0 if a reflink clone from directory $1 into directory $2 works.
+# A tiny probe file is cloned; cp's error output is suppressed because a
+# failure is an expected answer here, not an error.
+reflink_works() {
+    local probe_src probe_dst rc=1
+    probe_src="$(mktemp -- "${1}/.vbox-relocate.XXXXXXXX")" || return 1
+    if probe_dst="$(mktemp -- "${2}/.vbox-relocate.XXXXXXXX")"; then
+        if printf 'probe' > "${probe_src}" && cp --reflink=always -- "${probe_src}" "${probe_dst}" 2>/dev/null; then
+            rc=0
+        fi
+        rm -f -- "${probe_dst}"
+    fi
+    rm -f -- "${probe_src}"
+    return "${rc}"
+}
+
+# Allocated size of a directory in bytes.
+dir_bytes() {
+    du -s -B1 -- "${1}" | cut -f1
+}
+
+# Free bytes on the file system of a directory.
+free_bytes() {
+    df -B1 --output=avail -- "${1}" | tail -n 1 | tr -d ' '
+}
+
+# Read a value from /proc/meminfo in MiB (e.g. mem_mib MemAvailable).
+mem_mib() {
+    local key value _unit
+    while read -r key value _unit; do
+        if [ "${key}" = "${1}:" ]; then
+            printf '%s' "$((value / 1024))"
+            return 0
+        fi
+    done < /proc/meminfo
+    printf '0'
+}
+
+# List a directory tree for comparison: type, relative path, size (files)
+# or link target (symlinks). Directory sizes differ between file systems
+# and are therefore not compared.
+tree_listing() {
+    ( cd -- "${1}" && find . -mindepth 1 \
+        \( -type f -printf 'f\t%P\t%s\0' \) -o \
+        \( -type l -printf 'l\t%P\t%l\0' \) -o \
+        \( -type d -printf 'd\t%P\0' \) -o \
+        -printf '?\t%P\0' ) | LC_ALL=C sort -z
+}
+
+# SHA-256 of all regular files of a tree, sorted by path.
+tree_checksums() {
+    ( cd -- "${1}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum )
+}
+
+# =============================================================================
+# Journal and lock
+# =============================================================================
+
+# Take the per-VM lock so that only one run per VM is active.
+take_lock() {
+    mkdir -p -- "${STATE_DIR}"
+    exec {LOCK_FD}>"${STATE_DIR}/${1}.lock"
+    if ! flock -n "${LOCK_FD}"; then
+        die "Another vbox-relocate run is active for this VM (lock: ${STATE_DIR}/${1}.lock)"
+    fi
+}
+
+# Append KEY=VALUE to the journal (shell-quoted, so it can be sourced).
+journal_set() {
+    printf '%s=%q\n' "${1}" "${2}" >> "${JOURNAL_FILE}"
+    sync -- "${JOURNAL_FILE}"
+}
+
+# Find the journal of a VM given by UUID or name. Prints the path.
+find_journal() {
+    local vm="${1}" f name
+    if [[ "${vm}" != */* ]] && [ -f "${STATE_DIR}/${vm}.journal" ]; then
+        printf '%s' "${STATE_DIR}/${vm}.journal"
+        return 0
+    fi
+    for f in "${STATE_DIR}"/*.journal; do
+        [ -f "${f}" ] || continue
+        # shellcheck source=/dev/null
+        name="$( J_VM_NAME=""; . "${f}"; printf '%s' "${J_VM_NAME}" )"
+        if [ "${name}" = "${vm}" ]; then
+            printf '%s' "${f}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Reset all journal variables before sourcing a journal.
+journal_clear_vars() {
+    J_VM_UUID=""; J_VM_NAME=""; J_SRC_DIR=""; J_DST_DIR=""; J_TMP_DIR=""
+    J_CFG_NAME=""; J_STRATEGY=""; J_ORIG_STATE=""; J_START_TYPE=""
+    J_KEEP_SOURCE=0; J_STEP_SAVED=0; J_STEP_COPY_STARTED=0; J_STEP_RENAMED=0
+    J_TEMP_NAME=""; J_TEMP_UUID=""
+    J_RAM_STAGE=off; J_SNAP=""; J_SAV_NAME=""
+    J_SRC_ID=""; J_COPY_ID=""; J_START_INTENT=0
+    J_STEP_SRC_UNREGISTERED=0; J_STEP_DST_REGISTERED=0; J_STEP_DST_STARTED=0
+}
+
+# =============================================================================
+# Plan: prechecks and strategy selection
+# =============================================================================
+
+# Record a blocking problem (checked after all prechecks have run).
+block() {
+    BLOCKERS+=("$*")
+}
+
+# Record a warning for the plan output.
+note_warning() {
+    WARNINGS+=("$*")
+    syslog_event warning "$*"
+}
+
+# Run all prechecks for VM_ARG and TARGET and fill the P_* variables.
+# Exits with an error listing all blocking problems.
+build_plan() {
+    local i key path_key path uuid ver cfg cmd
+    local -a inside_idx=()
+
+    BLOCKERS=(); WARNINGS=()
+
+    # Tools
+    for cmd in "${VBOXMANAGE}" cp find du df numfmt findmnt flock realpath sort sha256sum stat; do
+        if ! command -v "${cmd}" >/dev/null; then
+            block "Required command not found: ${cmd}"
+        fi
+    done
+    if [ "${#BLOCKERS[@]}" -gt 0 ]; then
+        report_blockers
+    fi
+
+    ver="$(vbox_version)"
+    if [ "${ver}" != "7.2" ]; then
+        note_warning "VirtualBox ${ver} detected; the target version is 7.2"
+    fi
+
+    # VM information
+    load_vm_info "${VM_ARG}"
+    P_UUID="$(vmi UUID)"
+    P_NAME="$(vmi name)"
+    P_STATE="$(vmi VMState)"
+    P_CLASS="$(state_class "${P_STATE}")"
+    cfg="$(vmi CfgFile)"
+    P_CFG_NAME="$(basename -- "${cfg}")"
+    P_SRC_RAW="$(dirname -- "${cfg}")"
+    P_SRC="$(realpath -e -- "${P_SRC_RAW}")"
+    [[ "${P_UUID}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid machine UUID from VBoxManage"
+    [[ "${cfg}" = /* && -f "${cfg}" && ! -L "${cfg}" ]] || die "Invalid VM settings path: ${cfg}"
+    src_is_dedicated "${P_SRC}" "${P_CFG_NAME}" || die "A dedicated VM folder is required: ${P_SRC}"
+    if is_below "$(realpath -m -- "${STATE_DIR}")/journal" "${P_SRC}"; then
+        block "Journal directory must be outside the VM folder"
+    fi
+    P_SNAPFLDR="$(vmi SnapFldr)"
+    P_SESSION="$(vmi SessionName)"
+    P_MEMORY="$(vmi memory)"
+    P_VRAM="$(vmi vram)"
+    P_SNAP_COUNT=0
+    for key in "${!VMI[@]}"; do
+        case "${key}" in
+            SnapshotName|SnapshotName-*) P_SNAP_COUNT=$((P_SNAP_COUNT + 1)) ;;
+        esac
+    done
+
+    # VM state
+    case "${P_CLASS}" in
+        transient) block "VM is in a transitional state ('${P_STATE}'); try again later" ;;
+        offline)
+            if [ -n "${P_SESSION}" ]; then
+                block "VM is locked by session '${P_SESSION}' (e.g. an open settings dialog)"
+            fi
+            ;;
+    esac
+    if [ "$(vmi encryption)" != "" ] && [ "$(vmi encryption)" != "disabled" ]; then
+        block "Encrypted VMs are not supported"
+    fi
+
+    # Folders that must be inside the VM folder
+    if [ "$(realpath -m -- "${P_SNAPFLDR}")" != "${P_SRC}" ] && \
+       ! is_below "$(realpath -m -- "${P_SNAPFLDR}")" "${P_SRC}"; then
+        block "Snapshot folder is outside the VM folder: ${P_SNAPFLDR}"
+    fi
+    if [ -n "$(vmi LogFldr)" ] && ! is_below "$(realpath -m -- "$(vmi LogFldr)")" "${P_SRC}"; then
+        note_warning "Log folder is outside the VM folder and stays in place: $(vmi LogFldr)"
+    fi
+    if [ -n "$(vmi NvramFile)" ] && ! is_below "$(realpath -m -- "$(vmi NvramFile)")" "${P_SRC}"; then
+        note_warning "NVRAM file is outside the VM folder and stays in place: $(vmi NvramFile)"
+    fi
+
+    # Target
+    P_TARGET=""
+    P_DST=""
+    P_TMP=""
+    if [ ! -d "${TARGET}" ]; then
+        block "Target directory does not exist: ${TARGET}"
+    else
+        P_TARGET="$(realpath -e -- "${TARGET}")"
+        P_DST="${P_TARGET}/$(basename -- "${P_SRC}")"
+        P_TMP="${P_DST}${TMP_SUFFIX}"
+        if [ ! -w "${P_TARGET}" ]; then
+            block "Target directory is not writable: ${P_TARGET}"
+        fi
+        if [ "${P_DST}" = "${P_SRC}" ]; then
+            block "VM is already located in ${P_TARGET}"
+        elif is_below "${P_DST}" "${P_SRC}"; then
+            block "Target must not be inside the VM folder: ${P_DST}"
+        elif [ -e "${P_DST}" ] || [ -L "${P_DST}" ]; then
+            block "Target folder already exists: ${P_DST}"
+        fi
+        if [ -e "${P_TMP}" ] || [ -L "${P_TMP}" ]; then
+            block "Leftover temporary folder exists: ${P_TMP} (run 'recover' or remove it)"
+        fi
+    fi
+
+    # Media
+    load_media
+    P_MEDIA_IN=0
+    P_MEDIA_OUT=0
+    for i in "${!MED_UUID[@]}"; do
+        path="${MED_LOC[${i}]}"
+        if is_below "${path}" "${P_SRC}" || is_below "${path}" "${P_SRC_RAW}"; then
+            inside_idx+=("${i}")
+        fi
+    done
+    P_MEDIA_IN="${#inside_idx[@]}"
+    for i in "${inside_idx[@]}"; do
+        uuid="${MED_UUID[${i}]}"
+        if [ "${MED_STATE[${i}]}" = "inaccessible" ]; then
+            block "Medium is inaccessible: ${MED_LOC[${i}]}"
+        fi
+        # Children outside the folder belong to other VMs (linked clones).
+        local j
+        for j in "${!MED_UUID[@]}"; do
+            if [ "${MED_PARENT[${j}]}" = "${uuid}" ] && \
+               ! is_below "${MED_LOC[${j}]}" "${P_SRC}" && ! is_below "${MED_LOC[${j}]}" "${P_SRC_RAW}"; then
+                block "Medium ${MED_LOC[${i}]} has a child image outside the VM folder (linked clone?): ${MED_LOC[${j}]}"
+            fi
+        done
+        # VBoxManage indents each additional VM on a continuation line.
+        # The same disk/DVD can be in use by another machine even without a
+        # linked clone. Fail closed if its ownership cannot be queried.
+        local owners kind
+        case "${MED_KIND[${i}]}" in hdds) kind=disk ;; dvds) kind=dvd ;; floppies) kind=floppy ;; esac
+        if ! owners="$("${VBOXMANAGE}" showmediuminfo "${kind}" "${uuid}")"; then
+            block "Cannot check other users of medium ${uuid}"
+        elif awk -v vm="${P_UUID}" '
+            /^In use by VMs:/ { users=1 }
+            users && !/^In use by VMs:/ && !/^[[:space:]]/ { users=0 }
+            users {
+                sub(/ \[.*/, "")
+                if (match($0, /\(UUID: [[:xdigit:]-]+\)/)) {
+                    id=substr($0,RSTART+7,RLENGTH-8)
+                    if (tolower(id)!=tolower(vm)) other=1
+                }
+            }
+            END { exit !other }
+        ' <<< "${owners}"; then
+            block "Medium is also used by another VM: ${MED_LOC[${i}]}"
+        fi
+    done
+
+    # Media attached in the current state but stored outside the folder.
+    for key in "${!VMI[@]}"; do
+        case "${key}" in
+            *-ImageUUID-*)
+                path_key="${key%%-ImageUUID-*}-${key#*-ImageUUID-}"
+                path="$(vmi "${path_key}")"
+                if [ -n "${path}" ] && [ "${path}" != "none" ] && [ "${path}" != "emptydrive" ] && \
+                   ! is_below "${path}" "${P_SRC}" && ! is_below "${path}" "${P_SRC_RAW}"; then
+                    P_MEDIA_OUT=$((P_MEDIA_OUT + 1))
+                    note_warning "Medium outside the VM folder stays in place: ${path}"
+                fi
+                ;;
+        esac
+    done
+
+    # Media registered with an absolute path in the global registry would
+    # keep pointing to the old location after re-registration.
+    local vbox_xml="${VBOX_USER_HOME:-${HOME}/.config/VirtualBox}/VirtualBox.xml"
+    if [ -r "${vbox_xml}" ]; then
+        if grep -q -F -e "location=\"${P_SRC}/" -e "location=\"${P_SRC_RAW}/" -- "${vbox_xml}"; then
+            block "Media of this VM are registered in the global media registry (${vbox_xml}); not supported"
+        fi
+    fi
+
+    # Sizes, file system and strategy
+    P_SRC_SIZE="$(dir_bytes "${P_SRC}")"
+    P_SAME_FS=0
+    P_REFLINK=0
+    P_DST_FREE=0
+    P_FS_SRC="$(fs_type "${P_SRC}")"
+    P_FS_DST=""
+    if [ -n "${P_TARGET}" ]; then
+        P_FS_DST="$(fs_type "${P_TARGET}")"
+        P_DST_FREE="$(free_bytes "${P_TARGET}")"
+        if [ "$(fs_id "${P_SRC}")" = "$(fs_id "${P_TARGET}")" ]; then
+            P_SAME_FS=1
+            if [ -w "${P_SRC}" ] && [ -w "${P_TARGET}" ] && reflink_works "${P_SRC}" "${P_TARGET}"; then
+                P_REFLINK=1
+            fi
+        fi
+    fi
+    if [ ! -w "${P_SRC}" ]; then
+        block "VM folder is not writable: ${P_SRC}"
+    fi
+
+    choose_strategy
+
+    if [ "${P_REFLINK}" -eq 1 ] && [ "${P_STRATEGY}" != copy ]; then
+        P_REQUIRED="${SPACE_RESERVE_BYTES}"
+    else
+        P_REQUIRED=$((P_SRC_SIZE + SPACE_RESERVE_BYTES))
+        if ! command -v rsync >/dev/null; then
+            block "Required command not found: rsync (needed for copies without reflink)"
+        fi
+    fi
+
+
+    # Start type for running VMs
+    P_START_TYPE=""
+    if [ "${P_CLASS}" = "live" ]; then
+        P_START_TYPE="${START_TYPE}"
+        if [ "${P_START_TYPE}" = "auto" ]; then
+            case "${P_SESSION}" in
+                headless) P_START_TYPE="headless" ;;
+                GUI/Qt)   P_START_TYPE="gui" ;;
+                *)
+                    P_START_TYPE="$(vmi defaultfrontend)"
+                    case "${P_START_TYPE}" in
+                        gui|headless|separate) ;;
+                        *) P_START_TYPE="gui" ;;
+                    esac
+                    note_warning "Could not determine how the VM was started (session '${P_SESSION}'); using '${P_START_TYPE}'"
+                    ;;
+            esac
+        fi
+        if [ "${P_START_TYPE}" != "headless" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+            block "VM would be restarted with a GUI, but no display is available (use --start-type headless)"
+        fi
+    fi
+
+    # Account for the configured reserve and keep at least 10% of host RAM.
+    P_RAM_EST=$(( ((P_MEMORY + P_VRAM) * 105 + 99) / 100 ))
+    P_RAM_AVAIL="$(mem_mib MemAvailable)"
+    local total_mib reserve reason=""
+    total_mib="$(mem_mib MemTotal)"
+    reserve=$((10#${RAM_RESERVE}))
+    if ((total_mib / 10 > reserve)); then reserve=$((total_mib / 10)); fi
+    P_RAM_REQ=$((P_RAM_EST + reserve))
+    P_RAM_DECISION="not-applicable"
+    if [ "${P_CLASS}" = live ]; then
+        P_RAM_DECISION=disk
+        if [ "${RAM_MODE}" != off ]; then
+            if ((P_RAM_EST <= 0 || P_RAM_AVAIL < P_RAM_REQ)); then
+                reason="insufficient RAM (${P_RAM_AVAIL} MiB available, ${P_RAM_REQ} MiB required)"
+            elif ! ram_available; then
+                reason="the polkit helper is unavailable to this VM owner"
+            elif [ "$(realpath -m -- "${P_SNAPFLDR}")" != "${P_SNAPFLDR}" ] ||
+                 [ "${P_SNAPFLDR}" = "${P_SRC}" ]; then
+                reason="RAM mode needs a dedicated canonical snapshot directory"
+            fi
+            if [ -z "${reason}" ]; then
+                P_RAM_DECISION=ram
+                note_warning "Host power loss before resume loses the volatile saved state"
+                if [ "$(mem_mib SwapTotal)" -gt 0 ]; then note_warning "Swap is active; tmpfs pages may be swapped out"; fi
+            elif [ "${RAM_MODE}" = require ]; then
+                block "RAM mode required: ${reason}"
+            else
+                note_warning "Saving state to disk: ${reason}"
+            fi
+        fi
+    fi
+
+    if [ "${P_CLASS}" = live ]; then
+        local sav_bytes=$((P_RAM_EST * 1024 * 1024)) src_required=0
+        if [ "${P_RAM_DECISION}" = disk ] || [ "${RAM_MODE}" = auto ] || [ "${KEEP_SOURCE}" = 1 ]; then
+            src_required="${sav_bytes}"
+            if [ "${P_STRATEGY}" = copy ]; then P_REQUIRED=$((P_REQUIRED + sav_bytes)); fi
+        fi
+        if [ "${P_STRATEGY}" = copy ]; then
+            src_required=$((src_required + sav_bytes + SPACE_RESERVE_BYTES))
+            P_REQUIRED=$((P_REQUIRED + sav_bytes))
+            for i in "${inside_idx[@]}"; do
+                case "${MED_TYPE[${i}],,}" in
+                    writethrough*|shareable*) block "Live copy cannot freeze ${MED_TYPE[${i}]} medium: ${MED_LOC[${i}]}" ;;
+                esac
+            done
+        fi
+        if [ "${P_SAME_FS}" = 1 ]; then P_REQUIRED=$((P_REQUIRED + src_required)); fi
+        if [ "$(free_bytes "${P_SRC}")" -lt "${src_required}" ]; then block "Insufficient space for saved state and snapshot growth on source"; fi
+    fi
+    if [ -n "${P_TARGET}" ] && [ "${P_DST_FREE}" -lt "${P_REQUIRED}" ]; then
+        block "Not enough free space on target: $(human_bytes "${P_DST_FREE}") free, $(human_bytes "${P_REQUIRED}") required"
+    fi
+
+    if [ "${#BLOCKERS[@]}" -gt 0 ]; then
+        print_plan
+        report_blockers
+    fi
+}
+
+# Choose the strategy from the VM state, file system and --strategy.
+choose_strategy() {
+    P_STRATEGY="${STRATEGY}"
+    if [ "${P_STRATEGY}" = "auto" ]; then
+        case "${P_CLASS}" in
+            offline) P_STRATEGY="offline" ;;
+            live)
+                if [ "${P_REFLINK}" -eq 1 ]; then
+                    P_STRATEGY="reflink"
+                else
+                    P_STRATEGY="copy"
+                fi
+                ;;
+            *) P_STRATEGY="none" ;;
+        esac
+    fi
+    case "${P_STRATEGY}" in
+        offline)
+            if [ "${P_CLASS}" = "live" ]; then
+                block "Strategy 'offline' needs a VM that is not running (save or shut down the VM first)"
+            fi
+            ;;
+        reflink)
+            if [ "${P_CLASS}" != "live" ]; then
+                block "Strategy 'reflink' is meant for running VMs; use 'offline' or 'auto'"
+            fi
+            if [ "${P_REFLINK}" -ne 1 ] && [ -n "${P_TARGET}" ]; then
+                block "Reflink clones from ${P_SRC} to ${P_TARGET} are not possible (different file system or no reflink support)"
+            fi
+            ;;
+        copy)
+            if [ "${P_CLASS}" != live ]; then block "Strategy copy requires a running or paused VM"; fi
+            ;;
+    esac
+}
+
+# Print all blocking problems and exit.
+report_blockers() {
+    local b
+    for b in "${BLOCKERS[@]}"; do
+        err "${b}"
+    done
+    die "${#BLOCKERS[@]} blocking problem(s) found; nothing was changed"
+}
+
+# Print the plan (human readable or as PLAN records).
+print_plan() {
+    local w
+    if [ "${MACHINE_READABLE}" -eq 1 ]; then
+        printf 'PLAN vm_name=%s\n' "$(mr_quote "${P_NAME}")"
+        printf 'PLAN vm_uuid=%s\n' "$(mr_quote "${P_UUID}")"
+        printf 'PLAN vm_state=%s\n' "$(mr_quote "${P_STATE}")"
+        printf 'PLAN source_dir=%s\n' "$(mr_quote "${P_SRC}")"
+        printf 'PLAN target_dir=%s\n' "$(mr_quote "${P_DST}")"
+        printf 'PLAN strategy=%s\n' "$(mr_quote "${P_STRATEGY}")"
+        printf 'PLAN source_fs=%s\n' "$(mr_quote "${P_FS_SRC}")"
+        printf 'PLAN target_fs=%s\n' "$(mr_quote "${P_FS_DST}")"
+        printf 'PLAN same_filesystem=%s\n' "$(mr_quote "${P_SAME_FS}")"
+        printf 'PLAN reflink=%s\n' "$(mr_quote "${P_REFLINK}")"
+        printf 'PLAN snapshots=%s\n' "$(mr_quote "${P_SNAP_COUNT}")"
+        printf 'PLAN media_moved=%s\n' "$(mr_quote "${P_MEDIA_IN}")"
+        printf 'PLAN media_kept=%s\n' "$(mr_quote "${P_MEDIA_OUT}")"
+        printf 'PLAN source_size_bytes=%s\n' "$(mr_quote "${P_SRC_SIZE}")"
+        printf 'PLAN target_free_bytes=%s\n' "$(mr_quote "${P_DST_FREE}")"
+        printf 'PLAN required_bytes=%s\n' "$(mr_quote "${P_REQUIRED:-0}")"
+        printf 'PLAN start_type=%s\n' "$(mr_quote "${P_START_TYPE}")"
+        printf 'PLAN ram_estimate_mib=%s\n' "$(mr_quote "${P_RAM_EST:-0}")"
+        printf 'PLAN ram_available_mib=%s\n' "$(mr_quote "${P_RAM_AVAIL:-0}")"
+        printf 'PLAN ram_required_mib=%s\n' "$(mr_quote "${P_RAM_REQ:-0}")"
+        printf 'PLAN ram_decision=%s\n' "$(mr_quote "${P_RAM_DECISION:-}")"
+        printf 'PLAN keep_source=%s\n' "$(mr_quote "${KEEP_SOURCE}")"
+        printf 'PLAN blockers=%s\n' "$(mr_quote "${#BLOCKERS[@]}")"
+        for w in "${WARNINGS[@]}"; do
+            printf 'WARN %s\n' "${w}"
+        done
+        return 0
+    fi
+
+    if [ "${SILENT}" -eq 1 ]; then
+        return 0
+    fi
+    printf 'VM:            %s (%s)\n' "${P_NAME}" "${P_UUID}"
+    printf 'State:         %s\n' "${P_STATE}"
+    printf 'Source:        %s  [%s]\n' "${P_SRC}" "${P_FS_SRC}"
+    printf 'Target:        %s  [%s]\n' "${P_DST:-?}" "${P_FS_DST:-?}"
+    printf 'Strategy:      %s (same file system: %s, reflink: %s)\n' \
+        "${P_STRATEGY}" "${P_SAME_FS}" "${P_REFLINK}"
+    printf 'Snapshots:     %s\n' "${P_SNAP_COUNT}"
+    printf 'Media:         %s moved, %s kept in place\n' "${P_MEDIA_IN}" "${P_MEDIA_OUT}"
+    printf 'Size:          %s (target free: %s, required: %s)\n' \
+        "$(human_bytes "${P_SRC_SIZE}")" "$(human_bytes "${P_DST_FREE}")" "$(human_bytes "${P_REQUIRED:-0}")"
+    if [ "${P_CLASS}" = live ]; then
+        printf 'Switchover:    save and restore about %s MiB of VM state\n' "${P_RAM_EST}"
+        printf 'Start type:    %s\n' "${P_START_TYPE}"
+        printf 'RAM mode:      %s (estimate %s MiB, available %s MiB, required %s MiB)\n' \
+            "${P_RAM_DECISION}" "${P_RAM_EST}" "${P_RAM_AVAIL}" "${P_RAM_REQ}"
+    fi
+    if [ "${KEEP_SOURCE}" -eq 1 ]; then
+        printf 'Source folder: kept as %s%s-<timestamp>\n' "${P_SRC}" "${KEEP_SUFFIX}"
+    else
+        printf 'Source folder: removed after success\n'
+    fi
+    for w in "${WARNINGS[@]}"; do
+        printf 'Warning:       %s\n' "${w}"
+    done
+}
+
+# =============================================================================
+# Relocation steps
+# =============================================================================
+
+# Copy the VM folder to the temporary target. Reflink clones are used when
+# possible (no data is copied); otherwise rsync copies the data.
+copy_folder() {
+    local src="${1}" tmp="${2}" pct
+    local -a sync_flags=()
+    if [ "${P_STRATEGY}" = copy ]; then sync_flags=(--delete); fi
+    verbose "Copy source=${src}, target=${tmp}, reflink=${P_REFLINK}"
+    progress 0 copy
+    if [ "${P_REFLINK}" -eq 1 ] && [ "${P_STRATEGY}" != copy ]; then
+        verbose "cp -a --reflink=always ${src} ${tmp}"
+        cp -a --reflink=always -- "${src}/." "${tmp}/"
+    elif [ "${MACHINE_READABLE}" -eq 1 ]; then
+        # rsync reports progress with carriage returns; extract the percent
+        # values and forward them as PROGRESS records.
+        rsync -aH "${sync_flags[@]}" --sparse --no-inc-recursive --info=progress2 -- "${src}/" "${tmp}/" \
+            | tr '\r' '\n' \
+            | while IFS= read -r line; do
+                pct="$(printf '%s' "${line}" | grep -o '[0-9]\+%' | head -n 1 || true)"
+                if [ -n "${pct}" ]; then
+                    progress "${pct%\%}" copy
+                fi
+            done
+    elif [ "${SILENT}" -eq 1 ] || [ ! -t 1 ]; then
+        rsync -aH "${sync_flags[@]}" --sparse -- "${src}/" "${tmp}/"
+    else
+        rsync -aH "${sync_flags[@]}" --sparse --info=progress2 -- "${src}/" "${tmp}/"
+    fi
+    progress 100 copy
+}
+
+# Compare symlink resolution at the final location. A byte-for-byte copy
+# can still depend on the old source (for example an absolute disk link).
+# Staging and destination are siblings, so relative external paths resolve
+# identically there. Internal relative links must remain inside the copy.
+verify_links() {
+    local src="${1}" tmp="${2}" manifest="${3}" link old new expected
+    find "${src}" -type l -print0 > "${manifest}" || return 1
+    while IFS= read -r -d '' link; do
+        old="$(realpath -m -- "${link}")" || return 1
+        new="$(realpath -m -- "${tmp}/${link#"${src}/"}")" || return 1
+        if [ "${old}" = "${src}" ]; then
+            expected="${tmp}"
+        elif is_below "${old}" "${src}"; then
+            expected="${tmp}/${old#"${src}/"}"
+        else
+            expected="${old}"
+        fi
+        if [ "${new}" != "${expected}" ]; then
+            err "Symlink would resolve to the wrong location after relocation: ${link}"
+            return 1
+        fi
+    done < "${manifest}"
+}
+
+# Verify the copy against the source (file list and sizes, optionally
+# SHA-256 of all files).
+verify_copy() {
+    local src="${1}" tmp="${2}" work fn rc=0
+    work="$(mktemp -d -- "${STATE_DIR}/verify.XXXXXXXX")" || return 1
+    progress 0 verify
+    for fn in tree_listing tree_checksums; do
+        if [ "${fn}" = tree_checksums ] && [ "${VERIFY}" != checksum ]; then break; fi
+        if ! "${fn}" "${src}" > "${work}/source" ||
+           ! "${fn}" "${tmp}" > "${work}/target" ||
+           ! cmp -- "${work}/source" "${work}/target" >&2; then
+            err "Could not verify ${fn} for ${src} and ${tmp}"
+            rc=1
+            break
+        fi
+    done
+    if [ "${rc}" = 0 ]; then verify_links "${src}" "${tmp}" "${work}/links" || rc=1; fi
+    rm -rf -- "${work}" || return 1
+    [ "${rc}" = 0 ] || return 1
+    progress 100 verify
+}
+
+# Record media UUIDs and locations before unregistering. Equal counts alone
+# cannot prove that the original disk chain is registered at the new paths.
+remember_media() {
+    local i path relative
+    EXPECTED_MEDIA=()
+    for i in "${!MED_UUID[@]}"; do
+        path="${MED_LOC[${i}]}"
+        if is_below "${path}" "${P_SRC}"; then
+            relative="${path#"${P_SRC}/"}"
+        elif is_below "${path}" "${P_SRC_RAW}"; then
+            relative="${path#"${P_SRC_RAW}/"}"
+        else
+            continue
+        fi
+        EXPECTED_MEDIA["${MED_UUID[${i}]}"]="${P_DST}/${relative}"
+    done
+}
+
+# Verify that the VM is registered at the target with all media.
+verify_registration() {
+    local expected_state="${1}" i moved=0 left=0
+    load_vm_info "${P_UUID}"
+    if [ "$(vmi CfgFile)" != "${P_DST}/${P_CFG_NAME}" ]; then
+        err "VM settings file is '$(vmi CfgFile)', expected '${P_DST}/${P_CFG_NAME}'"
+        return 1
+    fi
+    if [ "$(vmi VMState)" != "${expected_state}" ]; then
+        err "VM state after registration is '$(vmi VMState)', expected '${expected_state}'"
+        return 1
+    fi
+    if [ "${expected_state}" = saved ] || [ "${expected_state}" = aborted-saved ]; then
+        local saved
+        saved="$(vmi VMStateFile)"
+        if ! is_below "${saved}" "${P_DST}" || [ ! -f "${saved}" ]; then
+            err "Saved state is missing or outside the relocated VM: ${saved}"
+            return 1
+        fi
+    fi
+    load_media
+    for i in "${!MED_UUID[@]}"; do
+        if is_below "${MED_LOC[${i}]}" "${P_DST}"; then
+            if [ "${EXPECTED_MEDIA[${MED_UUID[${i}]}]:-}" != "${MED_LOC[${i}]}" ]; then
+                err "Unexpected registered medium: ${MED_UUID[${i}]} at ${MED_LOC[${i}]}"
+                return 1
+            fi
+            moved=$((moved + 1))
+        elif is_below "${MED_LOC[${i}]}" "${P_SRC}" || is_below "${MED_LOC[${i}]}" "${P_SRC_RAW}"; then
+            left=$((left + 1))
+        fi
+    done
+    if [ "${moved}" -ne "${P_MEDIA_IN}" ] || [ "${left}" -ne 0 ]; then
+        err "Media after registration: ${moved} at the target (expected ${P_MEDIA_IN}), ${left} still at the source"
+        return 1
+    fi
+}
+
+# A VM stored directly in a home, a shared VM directory or above another
+# mount cannot be safely removed recursively. Repeat immediately before cleanup.
+src_is_dedicated() {
+    local src="${1}" cfg="${2}" others mounts item
+    [[ -d "${src}" && ! -L "${src}" && "${src}" != / && "${src}" != "${HOME}" && "${src%/*}" != "" ]] || return 1
+    others="$(find "${src}" -name '*.vbox' ! -path "${src}/${cfg}" -print -quit)" || return 1
+    [ -z "${others}" ] || return 1
+    mounts="$(findmnt -rn -o TARGET)" || return 1
+    while IFS= read -r item; do
+        printf -v item '%b' "${item}"
+        if [ "${item}" = "${src}" ] || is_below "${item}" "${src}"; then return 1; fi
+    done <<< "${mounts}"
+    return 0
+}
+
+# Check the inode recorded when we acquired a directory. Empty IDs only
+# occur in journals from version 0.1.0.
+same_dir() {
+    [[ -d "${1}" && ! -L "${1}" ]] && { [ -z "${2}" ] || [ "$(stat -c '%d:%i' -- "${1}")" = "${2}" ]; }
+}
+
+# Remove or keep the source folder after a successful relocation. Several
+# safety checks guard the recursive removal.
+cleanup_source() {
+    local src="${1}" dst="${2}" cfg_name="${3}" uuid="${4}" keep="${5}" kept
+    if [ ! -d "${src}" ]; then
+        verbose "Source folder already gone: ${src}"
+        return 0
+    fi
+    if ! same_dir "${src}" "${J_SRC_ID}" || ! src_is_dedicated "${src}" "${cfg_name}"; then
+        err "Refusing to clean up changed or shared directory: ${src}"
+        return 1
+    fi
+    if [ ! -f "${src}/${cfg_name}" ]; then
+        err "Refusing to remove '${src}': settings file ${cfg_name} not found there"
+        return 1
+    fi
+    if ! vm_registered "${uuid}" || ! vm_info_try "${uuid}" || [ "$(vmi CfgFile)" != "${dst}/${cfg_name}" ]; then
+        err "Refusing to remove '${src}': VM is not registered at ${dst}"
+        return 1
+    fi
+    if [ "${keep}" -eq 1 ]; then
+        kept="${src}${KEEP_SUFFIX}-$(date +%Y%m%d-%H%M%S)"
+        mv -Tn -- "${src}" "${kept}" && [ ! -e "${src}" ] || return 1
+        info "Source folder kept as ${kept}"
+        return 0
+    fi
+    rm -rf --one-file-system -- "${src}" || return 1
+    info "Source folder removed: ${src}"
+}
+
+# Start a VM and wait until it runs; pause it again if requested.
+start_vm() {
+    local uuid="${1}" type="${2}" orig_state="${3}"
+    vbm_action startvm "${uuid}" --type "${type}" || return 1
+    wait_for_running "${uuid}" || return 1
+    if [ "${orig_state}" = "paused" ] && [ "$(vmi VMState)" != "paused" ]; then
+        vbm_action controlvm "${uuid}" pause || warn "Could not pause the VM again"
+    fi
+}
+
+# Resolve the snapshot by our journaled, random name after a crash between
+# taking it and saving its UUID. Never delete a user's current snapshot.
+find_temp_snapshot() {
+    local key suffix
+    for key in "${!VMI[@]}"; do
+        case "${key}" in
+            SnapshotName|SnapshotName-*)
+                if [ "${VMI[${key}]}" = "${J_TEMP_NAME}" ]; then
+                    suffix="${key#SnapshotName}"
+                    vmi "SnapshotUUID${suffix}"
+                    return 0
+                fi ;;
+        esac
+    done
+}
+
+# Remove the temporary snapshot on the authoritative registration only.
+# A failed online merge is retryable without reversing the switchover.
+merge_snapshot() {
+    local cfg="${1}" found
+    [ -n "${J_TEMP_NAME}" ] || return 0
+    vm_info_try "${J_VM_UUID}" || return 1
+    [ "$(vmi CfgFile)" = "${cfg}" ] || { err "Unexpected registration while merging snapshot"; return 1; }
+    found="$(find_temp_snapshot)" || return 1
+    if [ -n "${J_TEMP_UUID}" ]; then
+        # UUID is stable even if the snapshot was renamed. Absence means a
+        # previous merge completed before the journal was updated.
+        local key match=0
+        for key in "${!VMI[@]}"; do
+            case "${key}" in SnapshotUUID|SnapshotUUID-*) [ "${VMI[${key}]}" != "${J_TEMP_UUID}" ] || match=1 ;; esac
+        done
+        if [ "${match}" = 0 ]; then found=""; else found="${J_TEMP_UUID}"; fi
+    fi
+    if [ -n "${found}" ]; then
+        step snapshot-delete "Merging temporary snapshot ${found}"
+        vbm_action snapshot "${J_VM_UUID}" delete "${found}" || {
+            warn "Snapshot merge incomplete; keep the journal and retry recover for ${J_VM_UUID}"
+            return 1
+        }
+    fi
+    J_TEMP_NAME=""; journal_set J_TEMP_NAME ""
+}
+
+# Walk the registered ancestry of active hard disks. Only immutable parents
+# are eligible for pre-copy. Unregistered extents and auxiliary files are
+# transferred once the VM is saved. NUL delimiters preserve literal names.
+precopy() {
+    local key child parent loc index id manifest changes
+    local -A parents=() locations=()
+    local -a check=(--size-only)
+    J_TEMP_NAME="vbox-relocate-$(cat /proc/sys/kernel/random/uuid)"
+    journal_set J_TEMP_NAME "${J_TEMP_NAME}"
+    step snapshot-take "Taking live snapshot ${J_TEMP_NAME}"
+    vbm_action snapshot "${P_UUID}" take "${J_TEMP_NAME}" --live || die "Live snapshot failed"
+    load_vm_info "${P_UUID}"
+    J_TEMP_UUID="$(find_temp_snapshot)"
+    [[ -n "${J_TEMP_UUID}" && "${J_TEMP_UUID}" = "$(vmi CurrentSnapshotUUID)" ]] || die "Cannot identify the new live snapshot"
+    journal_set J_TEMP_UUID "${J_TEMP_UUID}"
+    load_media
+    # A live snapshot creates new disks; registration must verify the
+    # post-snapshot media population, including the new writable children.
+    P_MEDIA_IN=0
+    for index in "${!MED_UUID[@]}"; do
+        loc="${MED_LOC[${index}]}"
+        if is_below "${loc}" "${P_SRC}" || is_below "${loc}" "${P_SRC_RAW}"; then P_MEDIA_IN=$((P_MEDIA_IN+1)); fi
+        [ "${MED_KIND[${index}]}" = hdds ] || continue
+        id="${MED_UUID[${index}]}"
+        parents["${id}"]="${MED_PARENT[${index}]}"
+        locations["${id}"]="${loc}"
+    done
+    manifest="${JOURNAL_FILE}.files"
+    : > "${manifest}"
+    declare -A seen=()
+    for key in "${!VMI[@]}"; do
+        [[ "${key}" = *-ImageUUID-* ]] || continue
+        child="${VMI[${key}]}"
+        [ -n "${child}" ] || continue
+        seen=()
+        while [ -n "${parents[${child}]:-}" ]; do
+            parent="${parents[${child}]}"
+            [[ -n "${locations[${parent}]:-}" ]] || break
+            [[ -z "${seen[${parent}]:-}" ]] || die "Cycle in disk parent chain"
+            seen["${parent}"]=1
+            loc="${locations[${parent}]}"
+            if is_below "${loc}" "${P_SRC}"; then printf '%s\0' "${loc#"${P_SRC}/"}" >> "${manifest}"; fi
+            child="${parent}"
+        done
+    done
+    # Historical saved states, including the live snapshot just taken, are
+    # immutable. Never include the final savestate or an active disk leaf.
+    if [ "${P_SNAPFLDR}" = "${P_SRC}" ]; then
+        (cd -- "${P_SRC}" && find . -type f -name '*.sav' -print0) >> "${manifest}"
+    elif [ -d "${P_SNAPFLDR}" ]; then
+        (cd -- "${P_SRC}" && find "./${P_SNAPFLDR#"${P_SRC}/"}" -type f -name '*.sav' -print0) >> "${manifest}"
+    fi
+    step precopy "Copying frozen images and snapshot states while the guest is live"
+    progress 0 precopy
+    rsync -aHS --from0 --files-from="${manifest}" -- "${P_SRC}/" "${P_TMP}/"
+    if [ "${VERIFY}" = checksum ]; then check=(--checksum); fi
+    changes="$(rsync -ani "${check[@]}" --from0 --files-from="${manifest}" -- "${P_SRC}/" "${P_TMP}/")" || die "Cannot verify frozen files"
+    [ -z "${changes}" ] || die "Frozen files differ after pre-copy: ${changes}"
+    progress 100 precopy
+}
+
+# Only user-owned VirtualBox sessions can request the installed polkit helper.
+ram_available() {
+    [ "${UID}" != 0 ] && command -v pkexec >/dev/null && [ -x /usr/libexec/vbox-relocate/vbox-relocate-helper ]
+}
+
+# A fixed, administrator-installed executable is the only privileged entry point.
+ram_helper() {
+    pkexec /usr/libexec/vbox-relocate/vbox-relocate-helper "$@" >&2
+}
+
+# Record intent before pausing or mounting. Rollback can undo either operation
+# even if the CLI dies before VBoxManage or pkexec returns.
+ram_prepare() {
+    J_RAM_STAGE=prepare; journal_set J_RAM_STAGE prepare
+    J_SNAP="${P_SNAPFLDR}"; journal_set J_SNAP "${J_SNAP}"
+    mkdir -p -- "${J_SNAP}"
+    if [ "${P_STATE}" = running ]; then
+        vbm_action controlvm "${P_UUID}" pause || die "Could not pause the guest before mounting its snapshot overlay"
+    fi
+    if ! ram_helper prepare "${P_UUID}" "${P_RAM_EST}" "${P_SRC}/${P_CFG_NAME}" "${J_SNAP}"; then
+        if [ "${RAM_MODE}" = require ]; then die "Required RAM setup failed"; fi
+        # If setup partially succeeded, confirm teardown before continuing on disk.
+        ram_release || die "RAM setup incomplete; recover before continuing"
+        warn "RAM setup unavailable; saving the guest state to disk"
+    fi
+}
+
+# Preserve the exact file selected by VBoxManage. The privileged helper only
+# accepts an upper directory containing that one file and releases the overlay.
+ram_capture() {
+    local saved_path name link
+    if [ -z "${J_SAV_NAME}" ]; then
+        vm_info_try "${J_VM_UUID}" || return 1
+        saved_path="$(vmi VMStateFile)"
+        [ "$(dirname -- "${saved_path}")" = "${J_SNAP}" ] || { err "Unexpected VMStateFile: ${saved_path}"; return 1; }
+        name="$(basename -- "${saved_path}")"
+        [[ "${name}" = *.sav ]] || return 1
+        J_SAV_NAME="${name}"; journal_set J_SAV_NAME "${name}" || return 1
+    fi
+    ram_helper capture "${J_VM_UUID}" "${J_SAV_NAME}" || return 1
+    link="${J_SNAP}/${J_SAV_NAME}"
+    local backing
+    backing="$(ram_root)/ram/state/${J_SAV_NAME}"
+    [ -f "${backing}" ] || { err "RAM state is missing: ${backing}"; return 1; }
+    if [ -L "${link}" ]; then
+        [ "$(readlink -- "${link}")" = "${backing}" ] || return 1
+    else
+        ln -sT -- "${backing}" "${link}" || return 1
+    fi
+    J_RAM_STAGE=captured; journal_set J_RAM_STAGE captured
+}
+
+# Private runtime path is derived from the invoking UID, never supplied to root.
+ram_root() {
+    printf '/run/vbox-relocate/%s/%s' "${UID}" "${J_VM_UUID}"
+}
+
+# Once the VM has resumed, release volatile state. With --keep-source the
+# saved source must still be restorable after tmpfs disappears.
+ram_release() {
+    local link tmp backing
+    [ "${J_RAM_STAGE}" != off ] || return 0
+    if [ "${J_STEP_DST_STARTED}" = 1 ] && [ "${J_KEEP_SOURCE}" = 1 ] && [ -n "${J_SAV_NAME}" ]; then
+        link="${J_SNAP}/${J_SAV_NAME}"
+        backing="$(ram_root)/ram/state/${J_SAV_NAME}"
+        if [ -L "${link}" ]; then
+            [ "$(readlink -- "${link}")" = "${backing}" ] || return 1
+            tmp="$(mktemp -- "${J_SNAP}/.relocate-state.XXXXXXXX")" || return 1
+            if ! cp --sparse=always -- "${backing}" "${tmp}" || ! mv -Tf -- "${tmp}" "${link}"; then
+                rm -f -- "${tmp}"
+                return 1
+            fi
+        elif [ ! -f "${link}" ]; then
+            err "Retained source saved state is missing"; return 1
+        fi
+    fi
+    if [ -e "$(ram_root)/operation.json" ]; then ram_helper release "${J_VM_UUID}" || return 1; fi
+    J_RAM_STAGE=off; journal_set J_RAM_STAGE off
+}
+
+# Roll back an interrupted relocation using the journal variables (J_*).
+# Errors do not stop the rollback; every step reports its own failure.
+# Returns 0 if the source is fully restored.
+rollback() {
+    local ok=1
+    step rollback "Rolling back to ${J_SRC_DIR}"
+    set +e
+
+    # Never touch the target copy if the source settings file is missing.
+    if ! same_dir "${J_SRC_DIR}" "${J_SRC_ID}" || [ ! -f "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
+        err "Source settings file missing (${J_SRC_DIR}/${J_CFG_NAME}); manual intervention required"
+        set -e
+        return 1
+    fi
+
+    # 1. VM registered at the target: unregister it there.
+    if vm_registered "${J_VM_UUID}" && vm_info_try "${J_VM_UUID}" && \
+       [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ]; then
+        case "$(state_class "$(vmi VMState)")" in
+            offline)
+                if [ "${J_START_INTENT}" = 1 ] && [ "$(vmi VMState)" != saved ]; then
+                    err "The target may have run since switchover; preserving both copies and the journal"
+                    return 1
+                fi
+                vbm_action unregistervm "${J_VM_UUID}" || { err "Could not unregister the VM at the target"; ok=0; }
+                ;;
+            *)
+                err "VM is active at the target (state '$(vmi VMState)'); not rolling back. Run 'recover' again later."
+                set -e
+                return 1
+                ;;
+        esac
+    fi
+
+    # 2. Register the VM at the source again.
+    if [ "${ok}" -eq 1 ] && ! vm_registered "${J_VM_UUID}"; then
+        vbm_action registervm "${J_SRC_DIR}/${J_CFG_NAME}" || { err "Could not register the VM at the source"; ok=0; }
+    fi
+
+    # Confirm which machine is authoritative before attempting restoration.
+    if ! vm_info_try "${J_VM_UUID}" || [ "$(vmi CfgFile)" != "${J_SRC_DIR}/${J_CFG_NAME}" ]; then
+        err "Source registration could not be confirmed; retaining both trees and the journal"
+        return 1
+    fi
+    # Reconstruct the source link even if savestate completed between journal writes.
+    if [ "${ok}" = 1 ] && [ "${J_RAM_STAGE}" = prepare ] && [ "$(vmi VMState)" = saved ]; then
+        ram_capture || { err "RAM capture incomplete; retaining the VM and mounts"; return 1; }
+    elif [ "${J_RAM_STAGE}" = prepare ] && [ "$(state_class "$(vmi VMState)")" = live ]; then
+        # A failed save may have left an upper file. Keep the guest paused
+        # until the helper confirms that detaching the overlay is safe.
+        ram_release || { err "Inspect the snapshot overlay before resuming the guest"; return 1; }
+    fi
+
+    # 4. Restart a VM that was running before.
+    if [ "${ok}" -eq 1 ] && [ "$(state_class "${J_ORIG_STATE}")" = "live" ]; then
+        if [ "$(vmi VMState)" = "saved" ]; then
+            start_vm "${J_VM_UUID}" "${J_START_TYPE}" "${J_ORIG_STATE}" || { err "Could not restart the VM at the source"; ok=0; }
+        elif [ "$(vmi VMState)" = paused ] && [ "${J_ORIG_STATE}" = running ]; then
+            vbm_action controlvm "${J_VM_UUID}" resume || ok=0
+        elif [ "$(state_class "$(vmi VMState)")" != live ]; then
+            err "Unexpected source state: $(vmi VMState)"
+            ok=0
+        fi
+    fi
+
+    if [ "${ok}" = 1 ]; then ram_release || ok=0; fi
+    if [ "${ok}" = 1 ]; then merge_snapshot "${J_SRC_DIR}/${J_CFG_NAME}" || ok=0; fi
+    if [ "${ok}" -eq 1 ]; then
+        if { [ "${J_STEP_RENAMED}" = "1" ] || [ -n "${J_COPY_ID}" ]; } && same_dir "${J_DST_DIR}" "${J_COPY_ID}"; then
+            rm -rf --one-file-system -- "${J_DST_DIR}" || { err "Could not remove ${J_DST_DIR}"; ok=0; }
+        fi
+        if [ "${J_STEP_COPY_STARTED}" = "1" ] && same_dir "${J_TMP_DIR}" "${J_COPY_ID}"; then
+            rm -rf --one-file-system -- "${J_TMP_DIR}" || { err "Could not remove ${J_TMP_DIR}"; ok=0; }
+        fi
+    fi
+
+    set -e
+    if [ "${ok}" -eq 1 ]; then
+        rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
+        info "Rollback finished; the VM is at ${J_SRC_DIR} again"
+        return 0
+    fi
+    err "Rollback incomplete; journal kept: ${JOURNAL_FILE}"
+    return 1
+}
+
+# EXIT trap: roll back an active relocation and emit the final result.
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if [ "${RUN_ACTIVE}" -eq 1 ]; then
+        RUN_ACTIVE=0
+        err "Relocation aborted (exit status ${rc})"
+        if [ "${J_STEP_DST_STARTED}" = "1" ]; then
+            err "The VM already runs at the target; finish with: ${SCRIPT_NAME} recover ${J_VM_UUID}"
+            result failed
+        elif rollback; then
+            result rolled-back
+        else
+            result failed
+        fi
+        [ "${rc}" -ne 0 ] || rc=1
+    elif [ "${rc}" -ne 0 ]; then
+        result failed
+    fi
+    exit "${rc}"
+}
+
+# =============================================================================
+# Subcommands
+# =============================================================================
+
+# Subcommand "list".
+cmd_list() {
+    local out line name uuid folder size snaps key state
+    out="$("${VBOXMANAGE}" list vms)" || die "Cannot list VMs ('VBoxManage list vms' failed)"
+    if [ "${MACHINE_READABLE}" -eq 0 ] && [ "${SILENT}" -eq 0 ]; then
+        printf '%-28s %-14s %10s %5s  %s\n' "NAME" "STATE" "SIZE" "SNAPS" "FOLDER"
+    fi
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        uuid="${line##*\{}"
+        uuid="${uuid%\}}"
+        name="${line%\" \{*}"
+        name="${name#\"}"
+        if vm_info_try "${uuid}"; then
+            folder="$(dirname -- "$(vmi CfgFile)")"
+            size="$(dir_bytes "${folder}" || printf '0')"
+            snaps=0
+            for key in "${!VMI[@]}"; do
+                case "${key}" in
+                    SnapshotName|SnapshotName-*) snaps=$((snaps + 1)) ;;
+                esac
+            done
+            state="$(vmi VMState)"
+        else
+            folder=""; size=0; snaps=0; state="inaccessible"
+        fi
+        if [ "${MACHINE_READABLE}" -eq 1 ]; then
+            printf 'VM uuid=%s name=%s state=%s folder=%s size_bytes=%s snapshots=%s\n' \
+                "$(mr_quote "${uuid}")" "$(mr_quote "${name}")" "$(mr_quote "${state}")" \
+                "$(mr_quote "${folder}")" "$(mr_quote "${size}")" "$(mr_quote "${snaps}")"
+        elif [ "${SILENT}" -eq 0 ]; then
+            printf '%-28s %-14s %10s %5s  %s\n' "${name}" "${state}" "$(human_bytes "${size}")" "${snaps}" "${folder}"
+        fi
+    done <<< "${out}"
+    result ok
+}
+
+# Subcommand "plan".
+cmd_plan() {
+    step precheck "Checking VM '${VM_ARG}' and target '${TARGET}'"
+    build_plan
+    print_plan
+    info "No blocking problems found; 'run' would use strategy '${P_STRATEGY}'"
+    result ok
+}
+
+# Ask for confirmation unless --yes is given.
+confirm() {
+    local answer
+    if [ "${ASSUME_YES}" -eq 1 ]; then
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "Confirmation required but STDIN is not a terminal; use --yes"
+    fi
+    printf 'Relocate VM "%s" to %s? [y/N] ' "${P_NAME}" "${P_DST}" >&2
+    read -r answer
+    case "${answer,,}" in
+        y|yes) return 0 ;;
+        *) die "Aborted by user; nothing was changed" ;;
+    esac
+}
+
+# Subcommand "run".
+cmd_run() {
+    step precheck "Checking VM '${VM_ARG}' and target '${TARGET}'"
+    load_vm_info "${VM_ARG}"
+    local locked_uuid
+    locked_uuid="$(vmi UUID)"
+    [[ "${locked_uuid}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid VM UUID"
+    take_lock "${locked_uuid}"
+    VM_ARG="${locked_uuid}"
+    build_plan
+    print_plan
+    confirm
+    if [ "${P_RAM_DECISION}" = ram ] && ! ram_helper authorize "${P_UUID}"; then
+        [ "${RAM_MODE}" != require ] || die "RAM setup authorization was denied"
+        P_RAM_DECISION=disk
+        warn "RAM setup was not authorized; saving the guest state to disk"
+    fi
+
+    # Open the journal. From here on every failure triggers a rollback.
+    JOURNAL_FILE="${STATE_DIR}/${P_UUID}.journal"
+    if [ -e "${JOURNAL_FILE}" ]; then
+        die "A journal of an earlier run exists (${JOURNAL_FILE}); run '${SCRIPT_NAME} recover ${P_UUID}' first"
+    fi
+    journal_clear_vars
+    J_VM_UUID="${P_UUID}"; J_VM_NAME="${P_NAME}"; J_SRC_DIR="${P_SRC}"; J_DST_DIR="${P_DST}"
+    J_TMP_DIR="${P_TMP}"; J_CFG_NAME="${P_CFG_NAME}"
+    # shellcheck disable=SC2034  # journal field, only written for diagnosis
+    J_STRATEGY="${P_STRATEGY}"
+    J_ORIG_STATE="${P_STATE}"; J_START_TYPE="${P_START_TYPE}"; J_KEEP_SOURCE="${KEEP_SOURCE}"
+    J_SRC_ID="$(stat -c '%d:%i' -- "${P_SRC}")"
+    # Publish the initial record atomically before changing either VM tree.
+    local final_journal="${JOURNAL_FILE}"
+    JOURNAL_FILE="$(mktemp -- "${STATE_DIR}/.init.XXXXXXXX")"
+    for key in J_VM_UUID J_VM_NAME J_SRC_DIR J_DST_DIR J_TMP_DIR J_CFG_NAME J_STRATEGY \
+               J_ORIG_STATE J_START_TYPE J_KEEP_SOURCE J_SRC_ID; do
+        journal_set "${key}" "${!key}"
+    done
+    mv -T -- "${JOURNAL_FILE}" "${final_journal}"
+    JOURNAL_FILE="${final_journal}"
+    RUN_ACTIVE=1
+
+    mkdir -m 700 -- "${P_TMP}" || die "Could not reserve ${P_TMP}"
+    J_COPY_ID="$(stat -c '%d:%i' -- "${P_TMP}")"; journal_set J_COPY_ID "${J_COPY_ID}"
+    J_STEP_COPY_STARTED=1; journal_set J_STEP_COPY_STARTED 1
+    if [ "${P_STRATEGY}" = copy ]; then precopy; fi
+    remember_media
+    load_vm_info "${P_UUID}"
+    if [ "$(realpath -e -- "$(vmi CfgFile)")" != "${P_SRC}/${P_CFG_NAME}" ] ||
+       [ "$(vmi VMState)" != "${P_STATE}" ] ||
+       { [ -n "${J_TEMP_UUID}" ] && [ "$(vmi CurrentSnapshotUUID)" != "${J_TEMP_UUID}" ]; }; then
+        die "VM registration, state or current snapshot changed during preparation"
+    fi
+
+    # Switchover begins: save the state of a running VM.
+    local expected_state="${P_STATE}"
+    if [ "${P_CLASS}" = live ]; then
+        step savestate "Saving the VM state (switchover begins)"
+        downtime begin
+        if [ "${P_RAM_DECISION}" = ram ] && [ "$(mem_mib MemAvailable)" -lt "${P_RAM_REQ}" ]; then
+            [ "${RAM_MODE}" != require ] || die "Free RAM fell below the required reserve"
+            P_RAM_DECISION=disk
+            warn "Free RAM fell below the reserve; saving the guest state to disk"
+        fi
+        if [ "${P_RAM_DECISION}" = ram ]; then ram_prepare; fi
+        if ! vbm_action controlvm "${P_UUID}" savestate; then
+            # If the VM still runs, nothing has changed yet.
+            if vm_info_try "${P_UUID}" && [ "$(state_class "$(vmi VMState)")" = "live" ]; then
+                downtime end
+                die "Saving the VM state failed; the VM keeps running at the source"
+            fi
+            die "Saving the VM state failed"
+        fi
+        # shellcheck disable=SC2034  # journal field, read back by "recover"
+        J_STEP_SAVED=1; journal_set J_STEP_SAVED 1
+        if [ "${J_RAM_STAGE}" = prepare ]; then ram_capture || die "Could not capture saved RAM"; fi
+        expected_state="saved"
+    fi
+
+    # Copy and verify.
+    step copy "Copying ${P_SRC} to ${P_TMP}"
+    copy_folder "${P_SRC}" "${P_TMP}"
+    step verify "Verifying the copy (${VERIFY})"
+    verify_copy "${P_SRC}" "${P_TMP}" || die "Verification of the copy failed"
+    mv -Tn -- "${P_TMP}" "${P_DST}"
+    same_dir "${P_DST}" "${J_COPY_ID}" || die "Destination changed while copying"
+    J_STEP_RENAMED=1; journal_set J_STEP_RENAMED 1
+
+    load_vm_info "${P_UUID}"
+    if [ "$(realpath -e -- "$(vmi CfgFile)")" != "${P_SRC}/${P_CFG_NAME}" ] || [ "$(vmi VMState)" != "${expected_state}" ]; then
+        die "Source VM changed during the copy; refusing switchover"
+    fi
+
+    # Re-register at the target.
+    step register "Registering the VM at ${P_DST}"
+    vbm_action unregistervm "${P_UUID}" || die "Could not unregister the VM at the source"
+    # shellcheck disable=SC2034  # journal field, read back by "recover"
+    J_STEP_SRC_UNREGISTERED=1; journal_set J_STEP_SRC_UNREGISTERED 1
+    vbm_action registervm "${P_DST}/${P_CFG_NAME}" || die "Could not register the VM at the target"
+    J_STEP_DST_REGISTERED=1; journal_set J_STEP_DST_REGISTERED 1
+    verify_registration "${expected_state}" || die "Verification of the registration failed"
+
+    # Switchover ends: start the VM at the target.
+    if [ "${P_CLASS}" = live ]; then
+        step start "Starting the VM at the target (${P_START_TYPE})"
+        J_START_INTENT=1; journal_set J_START_INTENT 1
+        start_vm "${P_UUID}" "${P_START_TYPE}" "${P_STATE}" || die "Could not start the VM at the target"
+        downtime end
+    fi
+    J_STEP_DST_STARTED=1; journal_set J_STEP_DST_STARTED 1
+
+    # Clean up the source. A failure here does not roll back.
+    step cleanup "Cleaning up the source folder"
+    RUN_ACTIVE=0
+    ram_release || die "Could not release saved RAM; finish with recover"
+    merge_snapshot "${P_DST}/${P_CFG_NAME}" || die "Target is authoritative; retry recover to finish the merge"
+    if ! cleanup_source "${P_SRC}" "${P_DST}" "${P_CFG_NAME}" "${P_UUID}" "${KEEP_SOURCE}"; then
+        err "Relocation succeeded, but the source could not be cleaned up; finish with: ${SCRIPT_NAME} recover ${P_UUID}"
+        result failed
+        exit 1
+    fi
+    rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
+    info "VM '${P_NAME}' relocated to ${P_DST}"
+    result ok
+}
+
+# Subcommand "recover": finish (VM already started at the target) or roll
+# back an interrupted run.
+cmd_recover() {
+    local journal
+    if ! journal="$(find_journal "${VM_ARG}")"; then
+        die "No journal found for '${VM_ARG}' in ${STATE_DIR}"
+    fi
+    take_lock "$(basename -- "${journal}" .journal)"
+    [ -f "${journal}" ] || die "Journal has already been processed"
+    JOURNAL_FILE="${journal}"
+    journal_clear_vars
+    # shellcheck source=/dev/null
+    . "${JOURNAL_FILE}"
+    [[ -n "${J_VM_UUID}" && -n "${J_CFG_NAME}" && "${J_SRC_DIR}" = /* && "${J_DST_DIR}" = /* ]] || die "Incomplete journal: ${journal}"
+
+    # The VM may already run at the target although the journal does not
+    # say so yet (e.g. interrupted while waiting for the start).
+    if [ "${J_STEP_DST_STARTED}" != "1" ] && vm_registered "${J_VM_UUID}" && vm_info_try "${J_VM_UUID}" && \
+       [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ] && \
+       [ "$(state_class "$(vmi VMState)")" = "live" ] && \
+       [ "${J_STEP_DST_REGISTERED}" = "1" ]; then
+        J_STEP_DST_STARTED=1
+    fi
+
+    if [ "${J_STEP_DST_STARTED}" = "1" ]; then
+        vm_info_try "${J_VM_UUID}" && [ "$(vmi CfgFile)" = "${J_DST_DIR}/${J_CFG_NAME}" ] ||
+            die "Cannot confirm target registration; keeping RAM, source and journal"
+        info "VM '${J_VM_NAME}' is at ${J_DST_DIR}; finishing the cleanup"
+        step cleanup "Cleaning up the source folder"
+        ram_release || die "Could not release saved RAM; journal kept"
+        merge_snapshot "${J_DST_DIR}/${J_CFG_NAME}" || die "Target snapshot cleanup pending"
+        cleanup_source "${J_SRC_DIR}" "${J_DST_DIR}" "${J_CFG_NAME}" "${J_VM_UUID}" "${J_KEEP_SOURCE}" \
+            || die "Cleanup failed; journal kept: ${JOURNAL_FILE}"
+        rm -f -- "${JOURNAL_FILE}.files" "${JOURNAL_FILE}"
+        result ok
+        return 0
+    fi
+
+    info "Rolling back the interrupted relocation of '${J_VM_NAME}'"
+    if [ "${ASSUME_YES}" -ne 1 ]; then
+        if [ ! -t 0 ]; then
+            die "Confirmation required but STDIN is not a terminal; use --yes"
+        fi
+        local answer
+        printf 'Roll back to %s? [y/N] ' "${J_SRC_DIR}" >&2
+        read -r answer
+        case "${answer,,}" in
+            y|yes) ;;
+            *) die "Aborted by user; nothing was changed" ;;
+        esac
+    fi
+    if rollback; then
+        result rolled-back
+        return 0
+    fi
+    die "Rollback incomplete"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    umask 077
+    load_config
+    apply_env
+    parse_args "$@"
+    validate_settings
+
+    trap on_exit EXIT
+    verbose "Command=${SUBCOMMAND}, verify=${VERIFY}, RAM mode=${RAM_MODE}"
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    journal_clear_vars
+    case "${SUBCOMMAND}" in
+        list)    cmd_list ;;
+        plan)    cmd_plan ;;
+        run)     cmd_run ;;
+        recover) cmd_recover ;;
+    esac
+}
+
+# Run main only when executed, not when sourced (unit tests source this
+# file). "return" only succeeds inside a sourced file; this also works for
+# "bash -c '. script'", where BASH_SOURCE[0] and $0 are identical.
+if ! (return 0 2>/dev/null); then
+    main "$@"
+fi

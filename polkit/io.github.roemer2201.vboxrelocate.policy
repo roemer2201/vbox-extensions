@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<policyconfig>
+  <action id="io.github.roemer2201.vboxrelocate.helper">
+    <description>Manage a temporary RAM filesystem for a VirtualBox saved state</description>
+    <message>Authentication is required to manage the VirtualBox relocation mounts</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/vbox-relocate/vbox-relocate-helper</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Stateful test double for live relocation failure paths without a hypervisor.
+
+Only models VBoxManage calls used by these tests. File copying, locking,
+checksums, journal recovery and CLI dispatch run normally.
+"""
+import json
+import os
+from pathlib import Path
+import sys
+
+base = Path(os.environ["WORKFLOW_DIR"])
+registry = base / "registered"
+uuid = "10000000-0000-4000-8000-000000000001"
+snapshot = "30000000-0000-4000-8000-000000000003"
+cmd, *args = sys.argv[1:]
+cfg = Path(registry.read_text()) if registry.exists() else None
+info = json.loads(cfg.read_text()) if cfg else {}
+fail = os.environ.get("WORKFLOW_FAIL")
+if cfg:
+    folder = cfg.parent
+    snapshots = folder / "Snapshots"
+    sav = snapshots / "switch.sav"
+
+
+def change():
+    cfg.write_text(json.dumps(info))
+
+
+if cmd == "--version":
+    print("7.2.6r172322")
+elif cmd == "showvminfo":
+    if not cfg:
+        sys.exit(1)
+    values = dict(name="VM", UUID=uuid, CfgFile=cfg, SnapFldr=snapshots,
+                  VMState=info["state"], SessionName="headless" if info["state"] in ("running", "paused") else "",
+                  memory=1, vram=1)
+    if info.get("snap"):
+        values.update(SnapshotName=info["snap"], SnapshotUUID=snapshot, CurrentSnapshotUUID=snapshot)
+    if info["state"] == "saved":
+        values["VMStateFile"] = sav
+    values["SATA-ImageUUID-0-0"] = "child" if info.get("snap") else "base"
+    values["SATA-0-0"] = snapshots / "delta.vdi" if info.get("snap") else folder / "base.vdi"
+    for key, value in values.items():
+        print(f'{key}="{value}"')
+elif cmd == "list" and args == ["hdds"]:
+    print(f"UUID: base\nParent UUID: base-none\nType: normal\nLocation: {folder}/base.vdi\n")
+    if info.get("snap"):
+        print(f"UUID: child\nParent UUID: base\nType: normal\nLocation: {snapshots}/delta.vdi\n")
+elif cmd == "list" and args in (["dvds"], ["floppies"]):
+    pass
+elif cmd == "showmediuminfo":
+    print(f"In use by VMs: VM (UUID: {uuid})")
+elif cmd == "snapshot" and args[1] == "take":
+    assert args[3] == "--live"
+    info["snap"] = args[2]
+    snapshots.mkdir(exist_ok=True)
+    (snapshots / "delta.vdi").write_text("post-snapshot writes")
+    (snapshots / "history.sav").write_text("online snapshot state")
+    change()
+elif cmd == "snapshot" and args[1] == "delete":
+    assert args[2] == snapshot and info["state"] in ("running", "paused")
+    if fail == "merge":
+        sys.exit(1)
+    (folder / "base.vdi").write_text((snapshots / "delta.vdi").read_text())
+    (snapshots / "delta.vdi").unlink()
+    (snapshots / "history.sav").unlink()
+    del info["snap"]
+    change()
+elif cmd == "controlvm" and args[1] == "savestate":
+    if info.get("snap"):
+        staging = Path(os.environ["WORKFLOW_TARGET"]) / "VM.relocate-tmp"
+        assert (staging / "base.vdi").is_file() and (staging / "Snapshots/history.sav").is_file()
+        assert not (staging / "Snapshots/delta.vdi").exists() and not (staging / "VM.vbox").exists()
+    if fail == "save":
+        sys.exit(1)
+    sav.write_text("guest memory")
+    info["state"] = "saved"
+    change()
+elif cmd == "controlvm" and args[1] in ("pause", "resume"):
+    info["state"] = "paused" if args[1] == "pause" else "running"
+    change()
+elif cmd == "unregistervm":
+    assert info["state"] in ("saved", "poweroff")
+    registry.unlink()
+elif cmd == "registervm":
+    if fail == "register" and Path(args[0]).is_relative_to(Path(os.environ["WORKFLOW_TARGET"])):
+        sys.exit(1)
+    registry.write_text(args[0])
+elif cmd == "startvm":
+    assert info["state"] == "saved" and sav.read_text() == "guest memory"
+    sav.unlink()
+    info["state"] = "running"
+    change()
+else:
+    sys.exit(f"Unexpected VBoxManage command: {sys.argv[1:]}")

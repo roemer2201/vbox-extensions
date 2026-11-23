@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Exercise the CLI and journal with a filesystem double at the mount boundary.
+# The Python helper tests cover the independent upper-directory checks.
+set -eu
+# shellcheck source=bin/vbox-relocate
+. "${BASH_SOURCE[0]%/*}/../../bin/vbox-relocate"
+ram_available() { return 0; }
+ram_root() { printf '%s/ram-test' "${WORKFLOW_DIR}"; }
+ram_helper() {
+    local root
+    root="$(ram_root)"
+    case "${1}" in
+        authorize) return 0 ;;
+        prepare)
+            mkdir -p -- "${root}/ram/state"
+            : > "${root}/operation.json"
+            ;;
+        capture)
+            if [ ! -f "${root}/ram/state/${3}" ]; then
+                mv -- "${J_SNAP}/${3}" "${root}/ram/state/${3}"
+            fi
+            ;;
+        release) rm -rf -- "${root}" ;;
+        *) return 1 ;;
+    esac
+}
+main "$@"
